@@ -921,6 +921,9 @@
       font-weight: 800;
       letter-spacing: .01em;
       line-height: 1.12;
+      width: 100%;
+      max-width: 100%;
+      flex-shrink: 0;
       padding: 6px 8px;
       word-break: break-word;
       text-wrap: balance;
@@ -929,6 +932,7 @@
 
     .flashHint {
       font-size: 14px;
+      flex-shrink: 0;
       color: var(--text-secondary);
       max-width: 48ch;
       line-height: 1.38;
@@ -1338,6 +1342,10 @@
       min-height: 56px;
       padding: 14px 14px;
       font-size: 17px;
+    }
+
+    .addCardInput {
+      min-height: 120px;
     }
 
     .bulkInput {
@@ -1765,6 +1773,17 @@
       flex: 0 0 auto;
     }
 
+    .allCardsActions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .allCardsEdit {
+      min-width: 100px;
+      flex: 0 0 auto;
+    }
+
     .allCardsEmpty {
       border-radius: var(--radius-md);
       border: 1px dashed var(--stroke-strong);
@@ -1894,7 +1913,8 @@
       }
 
       .studyWrap .flashInner {
-        min-height: 100%;
+        flex: 1;
+        min-height: 0;
       }
 
       .flashSpeakBtn {
@@ -1962,7 +1982,15 @@
 
       .allCardsDelete {
         min-width: 0;
+      }
+
+      .allCardsActions {
         width: 100%;
+      }
+
+      .allCardsActions .btn {
+        flex: 1 1 0;
+        min-width: 0;
       }
 
       #editDialog {
@@ -2143,14 +2171,14 @@
       <section id="viewList" class="card hide" aria-labelledby="tabList">
         <div class="row inputStack">
           <div class="col">
-            <input id="addFront" class="inputLarge" placeholder="z.B. gehen" aria-label="Vorderseite" autocomplete="off"
-              spellcheck="true" lang="de-DE" />
+            <textarea id="addFront" class="inputLarge addCardInput" rows="4" placeholder="z.B. gehen" aria-label="Vorderseite"
+              autocomplete="off" spellcheck="true" lang="de-DE"></textarea>
           </div>
         </div>
         <div class="row inputStack">
           <div class="col">
-            <input id="addBack" class="inputLarge" placeholder="z.B. to go" aria-label="Rückseite" autocomplete="off"
-              spellcheck="true" lang="de-DE" />
+            <textarea id="addBack" class="inputLarge addCardInput" rows="4" placeholder="z.B. to go" aria-label="Rückseite"
+              autocomplete="off" spellcheck="true" lang="de-DE"></textarea>
           </div>
         </div>
         <div class="row inputStack addInline">
@@ -2448,6 +2476,7 @@
   <script>
     (() => {
       const APP_NAME = "Vokabeltrainer";
+      const FLASH_WORD_MIN_FONT_SIZE = 12;
       const APP_VERSION_STORAGE_KEY = "vokabeln-last-seen-version";
       const SW_FILE = "./service-worker.js";
       const BADGE_SYNC_TAG = "vokabeln-badge-refresh";
@@ -5538,14 +5567,29 @@
         updateLastCompletedCardButton();
       }
 
-      function openEditDialogForCard(card) {
+      let editingAllCardsDraftId = "";
+
+      function openEditDialogForCard(card, options = {}) {
         if (!card) return;
+        const sourceCard = options.sourceCard || card;
         state.editingCardId = card.id;
-        el("editFront").value = card.front;
-        el("editBack").value = card.back;
-        setFlairChoiceValue(el("editFlairChoice"), card.flair);
+        editingAllCardsDraftId = String(options.allCardsDraftId || "");
+        el("editFront").value = sourceCard.front;
+        el("editBack").value = sourceCard.back;
+        setFlairChoiceValue(el("editFlairChoice"), sourceCard.flair);
         applyEditInputSpellcheck();
         showAppDialog(el("editDialog"));
+      }
+
+      function openEditDialogForAllCardsDraft(draftCard) {
+        const draftId = String(draftCard && draftCard.id || "");
+        if (!draftId) return;
+        const card = state.data.cards.find((entry) => String(entry && entry.id || "") === draftId) || null;
+        if (!card) return;
+        openEditDialogForCard(card, {
+          sourceCard: draftCard,
+          allCardsDraftId: draftId
+        });
       }
 
       function editCurrentCard() {
@@ -5563,7 +5607,27 @@
 
       function closeEditDialog() {
         state.editingCardId = null;
+        editingAllCardsDraftId = "";
         el("editDialog").close();
+      }
+
+      function syncCardToAllCardsDraft(card) {
+        const draftId = String(editingAllCardsDraftId || "");
+        if (!draftId || !card || !Array.isArray(allCardsDraft)) return false;
+        const draftCard = allCardsDraft.find((entry) => String(entry && entry.id || "") === draftId) || null;
+        if (!draftCard) return false;
+        draftCard.front = card.front;
+        draftCard.back = card.back;
+        draftCard.flair = card.flair;
+        draftCard.updatedAt = card.updatedAt;
+        return true;
+      }
+
+      function removeCardFromAllCardsDraft(cardId) {
+        const draftId = String(editingAllCardsDraftId || "");
+        if (!draftId || draftId !== String(cardId || "") || !Array.isArray(allCardsDraft)) return false;
+        allCardsDraft = allCardsDraft.filter((entry) => String(entry && entry.id || "") !== draftId);
+        return true;
       }
 
       let allCardsDraft = null;
@@ -5732,6 +5796,19 @@
           setFlairChoiceValue(flairWrap, card.flair);
           applyRowSpellcheck();
 
+          const actions = document.createElement("div");
+          actions.className = "allCardsActions";
+
+          const editBtn = document.createElement("button");
+          editBtn.type = "button";
+          editBtn.className = "btn allCardsEdit";
+          editBtn.textContent = "Bearbeiten";
+          editBtn.setAttribute("aria-label", `Karte ${index + 1} bearbeiten`);
+          editBtn.addEventListener("click", () => {
+            if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
+            openEditDialogForAllCardsDraft(allCardsDraft[index]);
+          });
+
           const deleteBtn = document.createElement("button");
           deleteBtn.type = "button";
           deleteBtn.className = "btn danger allCardsDelete";
@@ -5743,7 +5820,8 @@
             renderAllCardsDialog();
           });
 
-          row.append(indexBadge, flairWrap, frontInput, backInput, deleteBtn);
+          actions.append(editBtn, deleteBtn);
+          row.append(indexBadge, flairWrap, frontInput, backInput, actions);
           list.appendChild(row);
         });
       }
@@ -5856,22 +5934,26 @@
         card.back = nextBack;
         card.flair = nextFlair;
         markCardUpdated(card);
+        const renderAllCards = syncCardToAllCardsDraft(card);
         bumpLocalRevision();
         closeEditDialog();
         renderStudy();
         if (state.view === "list") renderList();
+        if (renderAllCards && el("allCardsDialog").open) renderAllCardsDialog();
       }
 
       function deleteFromEditDialog() {
         const card = getEditingCard();
         if (!card) { closeEditDialog(); return; }
         if (!confirm("Karte wirklich löschen?")) return;
+        const renderAllCards = removeCardFromAllCardsDraft(card.id);
         deleteCard(card.id);
         updateLastCompletedCardButton();
         bumpLocalRevision();
         closeEditDialog();
         buildQueue();
         if (state.view === "list") renderList();
+        if (renderAllCards && el("allCardsDialog").open) renderAllCardsDialog();
       }
 
       function formatDueCount() {
@@ -6061,6 +6143,81 @@
         buildQueue();
       }
 
+      let flashWordFitRaf = 0;
+      let flashWordResizeObserver = null;
+
+      function resetFlashWordSizes() {
+        el("flashFrontWord").style.removeProperty("font-size");
+        el("flashBackWord").style.removeProperty("font-size");
+      }
+
+      function getPixelValue(styles, property) {
+        return Number.parseFloat(styles.getPropertyValue(property)) || 0;
+      }
+
+      function flashWordFits(word, hint, face) {
+        const faceStyles = getComputedStyle(face);
+        const availableWidth = face.clientWidth
+          - getPixelValue(faceStyles, "padding-left")
+          - getPixelValue(faceStyles, "padding-right");
+        let availableHeight = face.clientHeight
+          - getPixelValue(faceStyles, "padding-top")
+          - getPixelValue(faceStyles, "padding-bottom");
+        const hintStyles = getComputedStyle(hint);
+        const hintVisible = hint.textContent.trim() !== "" && hintStyles.display !== "none";
+
+        if (hintVisible) {
+          availableHeight -= hint.getBoundingClientRect().height;
+          availableHeight -= getPixelValue(hintStyles, "margin-top");
+          availableHeight -= getPixelValue(hintStyles, "margin-bottom");
+          availableHeight -= getPixelValue(faceStyles, "row-gap") || getPixelValue(faceStyles, "gap");
+        }
+
+        if (availableWidth <= 0 || availableHeight <= 0) return false;
+        return word.scrollWidth <= availableWidth + 0.5
+          && word.scrollHeight <= availableHeight + 0.5;
+      }
+
+      function fitFlashWord(wordId, hintId) {
+        const word = el(wordId);
+        const hint = el(hintId);
+        const face = word.closest(".flashFace");
+        word.style.removeProperty("font-size");
+        const maximumFontSize = Number.parseFloat(getComputedStyle(word).fontSize) || FLASH_WORD_MIN_FONT_SIZE;
+
+        if (!face || face.clientWidth <= 0 || face.clientHeight <= 0) return;
+        word.style.fontSize = `${maximumFontSize}px`;
+        if (flashWordFits(word, hint, face)) return;
+
+        word.style.fontSize = `${FLASH_WORD_MIN_FONT_SIZE}px`;
+        if (!flashWordFits(word, hint, face)) return;
+
+        let lowerFontSize = FLASH_WORD_MIN_FONT_SIZE;
+        let upperFontSize = maximumFontSize;
+        while (upperFontSize - lowerFontSize > 0.25) {
+          const candidateFontSize = (lowerFontSize + upperFontSize) / 2;
+          word.style.fontSize = `${candidateFontSize}px`;
+          if (flashWordFits(word, hint, face)) {
+            lowerFontSize = candidateFontSize;
+          } else {
+            upperFontSize = candidateFontSize;
+          }
+        }
+        word.style.fontSize = `${lowerFontSize.toFixed(2)}px`;
+      }
+
+      function fitFlashWords() {
+        flashWordFitRaf = 0;
+        if (state.view !== "study" || !currentCard() || state.stageSplashActive) return;
+        fitFlashWord("flashFrontWord", "flashFrontHint");
+        fitFlashWord("flashBackWord", "flashBackHint");
+      }
+
+      function queueFlashWordFit() {
+        if (flashWordFitRaf) cancelAnimationFrame(flashWordFitRaf);
+        flashWordFitRaf = requestAnimationFrame(fitFlashWords);
+      }
+
       // Tabs / Views
       function setView(view) {
         const prevView = state.view;
@@ -6127,6 +6284,7 @@
           el("flashcard").classList.remove("show-back");
           el("flashcard").classList.remove("show-stage");
           el("btnEdit").disabled = true;
+          resetFlashWordSizes();
           return;
         }
         el("btnEdit").disabled = false;
@@ -6154,6 +6312,7 @@
         flashcard.classList.toggle("show-back", state.showingBack);
         flashcard.classList.toggle("show-stage", state.stageSplashActive);
         el("flashStageText").textContent = state.lastRatingMessage || "Neue Stufe: 1";
+        queueFlashWordFit();
 
       }
 
@@ -6490,6 +6649,15 @@
       };
       window.addEventListener("resize", queueTabIndicatorUpdate);
       window.addEventListener("orientationchange", queueTabIndicatorUpdate);
+      window.addEventListener("resize", queueFlashWordFit);
+      window.addEventListener("orientationchange", queueFlashWordFit);
+      if (typeof ResizeObserver === "function") {
+        flashWordResizeObserver = new ResizeObserver(queueFlashWordFit);
+        flashWordResizeObserver.observe(document.querySelector(".flashInner"));
+      }
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(queueFlashWordFit);
+      }
       window.addEventListener("popstate", handleDialogHistoryPopstate);
 
       document.querySelectorAll("dialog").forEach(bindDialogHistory);
@@ -6522,6 +6690,7 @@
       el("btnAllCardsSave").addEventListener("click", saveAllCardsDialog);
       el("editDialog").addEventListener("close", () => {
         state.editingCardId = null;
+        editingAllCardsDraftId = "";
       });
       el("allCardsDialog").addEventListener("close", () => {
         allCardsDraft = null;
@@ -6570,13 +6739,6 @@
       el("btnOpenBulkAddDialog").addEventListener("click", openBulkAddDialog);
       el("btnBulkAddCancel").addEventListener("click", closeBulkAddDialog);
       el("btnBulkAddImport").addEventListener("click", submitBulkAddDialog);
-      const onBackInputEnter = (e) => {
-        if (e.key !== "Enter") return;
-        if (!el("addFront").value.trim()) return;
-        e.preventDefault();
-        submitAddCard();
-      };
-      el("addBack").addEventListener("keydown", onBackInputEnter);
       el("bulkInput").addEventListener("input", (e) => {
         autoResizeTextarea(e.target);
       });

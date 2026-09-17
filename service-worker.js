@@ -1,4 +1,4 @@
-const VERSION = 20;
+const VERSION = 23;
 const CACHE_NAME = `vokabeln-v${VERSION}`;
 const ASSETS = [
   "./",
