@@ -2235,6 +2235,7 @@
         </div>
         <input id="backupImportInput" type="file" accept=".json,application/json" class="hide" aria-hidden="true"
           tabindex="-1" />
+        <div class="note" id="offlineStatus" role="status">Offline-Nutzung wird vorbereitet …</div>
         <div class="note" id="settingsVersion">Version: —</div>
       </section>
     </main>
@@ -2732,6 +2733,8 @@
       const SYNC_FIREBASE_SESSION_KEY = "syncFirebaseSession";
       const SYNC_FIREBASE_CONFIG_EXPORT_PROMPT_KEY = "syncFirebaseConfigExportPrompt";
       const SYNC_OUTBOX_KEY = "syncOutbox.v1";
+      const SYNC_LOCAL_SNAPSHOT_KEY = "localSnapshot.v1";
+      let localSnapshotPersistPromise = Promise.resolve();
       const THEME_MODE_KEY = "themeMode";
       const SYNC_RETRY_BASE_MS = 1200;
       const SYNC_RETRY_MAX_MS = 30000;
@@ -3735,6 +3738,7 @@
         if (state.suppressMutationSync) return;
         state.localRevision++;
         scheduleSyncWrite();
+        persistLocalSnapshot().catch(() => {});
         persistSyncOutboxSnapshot().catch(() => { });
         updateAppBadge();
       }
@@ -3958,12 +3962,22 @@
         if (synced) {
           state.lastSyncedRevision = state.localRevision;
           state.pendingSyncWrite = false;
-          clearSyncOutboxSnapshot().catch(() => { });
         } else {
           if (changed) {
             state.lastSyncedRevision = 0;
             state.pendingSyncWrite = true;
           }
+        }
+        const snapshotRevision = state.localRevision;
+        const snapshotPersisted = persistLocalSnapshot();
+        if (synced) {
+          snapshotPersisted.then(() => {
+            if (state.localRevision === snapshotRevision && !state.pendingSyncWrite) {
+              return clearSyncOutboxSnapshot();
+            }
+          }).catch(() => {});
+        } else {
+          snapshotPersisted.catch(() => {});
         }
         if (changed) {
           requestRenderAfterDataChange();
@@ -4083,6 +4097,33 @@
           tx.onabort = () => reject(tx.error || new Error("IndexedDB delete abgebrochen."));
         });
         db.close();
+      }
+
+      function persistLocalSnapshot() {
+        const localSyncState = getLocalSyncStateSnapshot();
+        const snapshot = {
+          revision: Number(state.localRevision) || 0,
+          lastSyncedRevision: Number(state.lastSyncedRevision) || 0,
+          cards: localSyncState.cards,
+          deletedCardIds: localSyncState.deletedCardIds,
+          savedAt: Date.now()
+        };
+        localSnapshotPersistPromise = localSnapshotPersistPromise.catch(() => {})
+          .then(() => idbSet(SYNC_LOCAL_SNAPSHOT_KEY, snapshot));
+        return localSnapshotPersistPromise;
+      }
+
+      async function restoreLocalSnapshot() {
+        const snapshot = await idbGet(SYNC_LOCAL_SNAPSHOT_KEY);
+        if (!snapshot || !Array.isArray(snapshot.cards)) return false;
+        const restoredState = normalizeSyncState(snapshot);
+        state.data.cards = restoredState.cards;
+        state.syncDeletedCardTimestamps = restoredState.deletedCardIds;
+        state.localRevision = Math.max(0, Number(snapshot.revision) || 0);
+        state.lastSyncedRevision = Math.min(state.localRevision,
+          Math.max(0, Number(snapshot.lastSyncedRevision) || 0));
+        state.pendingSyncWrite = state.lastSyncedRevision !== state.localRevision;
+        return true;
       }
 
       async function persistSyncOutboxSnapshot() {
@@ -6794,10 +6835,106 @@
         scheduleBadgeBackgroundRefreshRetry();
       });
       window.addEventListener("pagehide", clearBadgeRefreshSchedulers);
+      let serviceWorkerRegistrationStarted = false;
+      let serviceWorkerControllerListenerAdded = false;
+
+      async function initializeServiceWorker() {
+        if (serviceWorkerRegistrationStarted) return;
+        if (!("serviceWorker" in navigator) || !window.isSecureContext) {
+          el("offlineStatus").textContent = "Offline-Nutzung erfordert HTTPS und einen Browser mit Service-Worker-Unterstützung.";
+          return;
+        }
+        serviceWorkerRegistrationStarted = true;
+        try {
+          if (!serviceWorkerControllerListenerAdded) {
+            serviceWorkerControllerListenerAdded = true;
+            let reloadedOnControllerChange = false;
+            let hadServiceWorkerController = Boolean(navigator.serviceWorker.controller);
+            navigator.serviceWorker.addEventListener("controllerchange", async () => {
+              if (reloadedOnControllerChange) return;
+              if (!hadServiceWorkerController) {
+                hadServiceWorkerController = true;
+                return;
+              }
+              if (updateReloadApproved) {
+                reloadedOnControllerChange = true;
+                window.location.reload();
+                return;
+              }
+              const confirmed = await showConfirmDialog("Neue Version wurde installiert. Jetzt neu laden?", {
+                title: "Update aktiv",
+                okText: "Jetzt neu laden",
+                cancelText: "Später"
+              });
+              if (!confirmed) return;
+              reloadedOnControllerChange = true;
+              window.location.reload();
+            });
+          }
+
+          const registration = await navigator.serviceWorker.register(SW_FILE, {
+            scope: "./",
+            updateViaCache: "none"
+          });
+          const checkForAppUpdate = async () => {
+            try {
+              await registration.update();
+              await handleWaitingServiceWorker(registration);
+            } catch (e) {
+            }
+          };
+
+          navigator.serviceWorker.ready.then(async () => {
+            const appShell = await caches.match(new URL("./index.html", window.location.href).href);
+            el("offlineStatus").textContent = appShell
+              ? "Offline verfügbar. Gespeicherte Vokabeln können ohne Internet gelernt werden."
+              : "Offline-Nutzung noch nicht bereit. Bitte die App mit Internet neu öffnen.";
+            registerBadgeBackgroundRefresh();
+            updateAppBadge();
+            scheduleBadgeBackgroundRefreshRetry();
+          }).catch(() => {
+            el("offlineStatus").textContent = "Offline-Nutzung konnte nicht vorbereitet werden. Bitte die App mit Internet neu öffnen.";
+          });
+
+          await handleWaitingServiceWorker(registration);
+
+          const trackInstallingWorker = () => {
+            const installingWorker = registration.installing;
+            if (!installingWorker) return;
+            installingWorker.addEventListener("statechange", () => {
+              if (installingWorker.state === "installed" && navigator.serviceWorker.controller) {
+                handleWaitingServiceWorker(registration).catch(() => { });
+              }
+              if (installingWorker.state === "redundant" && !registration.active) {
+                serviceWorkerRegistrationStarted = false;
+                el("offlineStatus").textContent = "Offline-Nutzung konnte nicht vorbereitet werden. Bitte die App mit Internet neu öffnen.";
+              }
+            });
+          };
+          registration.addEventListener("updatefound", trackInstallingWorker);
+          trackInstallingWorker();
+
+          document.addEventListener("visibilitychange", () => {
+            if (document.visibilityState !== "visible") return;
+            checkForAppUpdate();
+          });
+          window.addEventListener("focus", checkForAppUpdate);
+
+          await checkForAppUpdate();
+        } catch (e) {
+          serviceWorkerRegistrationStarted = false;
+          el("offlineStatus").textContent = "Offline-Nutzung konnte nicht vorbereitet werden. Bitte die App mit Internet neu öffnen.";
+          console.error("Offline-Einrichtung fehlgeschlagen:", e);
+        }
+      }
+
+      window.addEventListener("online", initializeServiceWorker);
+      window.addEventListener("online", () => runAutoSync({ silent: true }));
+      initializeServiceWorker();
+
       // Init
       (async () => {
-        await applyAppVersion();
-        maybeShowInstalledVersionNotice();
+        applyAppVersion().then(maybeShowInstalledVersionNotice).catch(() => {});
         autoResizeTextarea(el("bulkInput"));
         wireFlairChoice("addFlairChoice", { onChange: applyAddInputSpellcheck });
         wireFlairChoice("editFlairChoice", { onChange: applyEditInputSpellcheck });
@@ -6805,79 +6942,15 @@
         renderFlashFlairToggles();
         configureSyncUi();
         await restoreSyncConfig();
+        await restoreLocalSnapshot();
         await restoreSyncOutboxSnapshot();
-        await runAutoSync({ silent: true });
         primeSpeechVoices();
         initGlassPointerMotion();
-
-        // PWA: register service worker and check for updates on startup
-        if ("serviceWorker" in navigator) {
-          window.addEventListener("load", async () => {
-            try {
-              let reloadedOnControllerChange = false;
-              let hadServiceWorkerController = Boolean(navigator.serviceWorker.controller);
-              navigator.serviceWorker.addEventListener("controllerchange", async () => {
-                if (reloadedOnControllerChange) return;
-                if (!hadServiceWorkerController) {
-                  hadServiceWorkerController = true;
-                  return;
-                }
-                if (updateReloadApproved) {
-                  reloadedOnControllerChange = true;
-                  window.location.reload();
-                  return;
-                }
-                const confirmed = await showConfirmDialog("Neue Version wurde installiert. Jetzt neu laden?", {
-                  title: "Update aktiv",
-                  okText: "Jetzt neu laden",
-                  cancelText: "Später"
-                });
-                if (!confirmed) return;
-                reloadedOnControllerChange = true;
-                window.location.reload();
-              });
-
-              const registration = await navigator.serviceWorker.register(SW_FILE, { scope: "./" });
-              const checkForAppUpdate = async () => {
-                try {
-                  await registration.update();
-                  await handleWaitingServiceWorker(registration);
-                } catch (e) {
-                  // ignore
-                }
-              };
-
-              await handleWaitingServiceWorker(registration);
-              await registerBadgeBackgroundRefresh();
-              await updateAppBadge();
-
-              registration.addEventListener("updatefound", () => {
-                const installingWorker = registration.installing;
-                if (!installingWorker) return;
-                installingWorker.addEventListener("statechange", () => {
-                  if (installingWorker.state === "installed" && navigator.serviceWorker.controller) {
-                    handleWaitingServiceWorker(registration).catch(() => { });
-                  }
-                });
-              });
-
-              document.addEventListener("visibilitychange", () => {
-                if (document.visibilityState !== "visible") return;
-                checkForAppUpdate();
-              });
-              window.addEventListener("focus", checkForAppUpdate);
-
-              await checkForAppUpdate();
-              scheduleBadgeBackgroundRefreshRetry();
-            } catch (e) {
-              // ignore
-            }
-          });
-        }
 
         setView("study");
         updateAppBadge();
         refreshBadgeSchedulers();
+        await runAutoSync({ silent: true });
       })();
     })();
   </script>

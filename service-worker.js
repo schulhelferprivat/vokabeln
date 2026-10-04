@@ -1,14 +1,14 @@
-const VERSION = 23;
+const VERSION = 24;
 const CACHE_NAME = `vokabeln-v${VERSION}`;
+const APP_SHELL_URL = new URL("./index.html", self.location.href).href;
 const ASSETS = [
-  "./",
-  "./index.html",
   "./manifest.webmanifest",
   "./service-worker.js",
   "./icon-32x32.png",
   "./icon-192x192.png",
   "./icon-512x512.png"
 ];
+const ASSET_URLS = new Set(ASSETS.map(asset => new URL(asset, self.location.href).href));
 const BADGE_DB_NAME = "vokabeln-badge-db";
 const BADGE_DB_STORE = "badge";
 const BADGE_CARDS_KEY = "cards";
@@ -101,16 +101,23 @@ async function recomputeBadgeFromStoredCards() {
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_NAME);
-    await cache.addAll(ASSETS);
+    await cache.add(new Request(APP_SHELL_URL, { cache: "reload" }));
+    const appShell = await cache.match(APP_SHELL_URL);
+    await cache.put(new URL("./", self.location.href).href, appShell.clone());
+    await Promise.allSettled(ASSETS.map(asset => cache.add(new Request(
+      new URL(asset, self.location.href).href,
+      { cache: "reload" }
+    ))));
   })());
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil((async () => {
     const keys = await caches.keys();
-    await Promise.all(keys.map(k => (k !== CACHE_NAME) ? caches.delete(k) : Promise.resolve()));
-    self.clients.claim();
-    await recomputeBadgeFromStoredCards();
+    await Promise.all(keys.filter(key => key.startsWith("vokabeln-v") && key !== CACHE_NAME)
+      .map(key => caches.delete(key)));
+    await self.clients.claim();
+    await recomputeBadgeFromStoredCards().catch(() => {});
   })());
 });
 
@@ -163,26 +170,29 @@ self.addEventListener("sync", (event) => {
 self.addEventListener("fetch", (event) => {
   const req = event.request;
 
-  // Only handle GET
   if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  const isAppNavigation = req.mode === "navigate" && url.href.startsWith(self.registration.scope);
+  const assetUrl = new URL(url.href);
+  assetUrl.search = "";
+  const isAppAsset = ASSET_URLS.has(assetUrl.href);
+  if (!isAppNavigation && !isAppAsset) return;
 
   event.respondWith((async () => {
-    const cached = await caches.match(req, { ignoreSearch: true });
+    const cache = await caches.open(CACHE_NAME);
+    const cacheKey = isAppNavigation ? APP_SHELL_URL : assetUrl.href;
+    const cached = await cache.match(cacheKey);
     if (cached) return cached;
 
     try {
       const fresh = await fetch(req);
-      // Opportunistic cache for same-origin requests
-      const url = new URL(req.url);
-      if (url.origin === self.location.origin) {
-        const cache = await caches.open(CACHE_NAME);
-        cache.put(req, fresh.clone());
+      if (fresh.ok && (!isAppNavigation || fresh.headers.get("Content-Type")?.includes("text/html"))) {
+        await cache.put(cacheKey, fresh.clone()).catch(() => {});
       }
       return fresh;
     } catch (e) {
-      // Offline fallback to app shell
-      const fallback = await caches.match("./index.html");
-      return fallback || new Response("Offline", { status: 503, statusText: "Offline" });
+      return new Response("Offline", { status: 503, statusText: "Offline" });
     }
   })());
 });
