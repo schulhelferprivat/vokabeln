@@ -157,7 +157,7 @@
 
     html {
       background: var(--bg-base);
-      overscroll-behavior-x: none;
+      overscroll-behavior: none;
     }
 
     body {
@@ -167,7 +167,7 @@
       color: var(--text-primary);
       padding: calc(var(--space-4) + var(--safe-top)) calc(var(--space-4) + var(--safe-right)) calc(var(--space-4) + var(--safe-bottom)) calc(var(--space-4) + var(--safe-left));
       -webkit-tap-highlight-color: transparent;
-      overscroll-behavior-x: none;
+      overscroll-behavior: none;
       position: relative;
       min-height: 100%;
     }
@@ -2680,6 +2680,21 @@
         }, delayMs);
       }
 
+      async function prepareAppReload() {
+        if (!state.localRestoreComplete) return true;
+        if (state.pendingRating) {
+          showNotice("Bitte speichere zuerst die ausstehende Bewertung, bevor du die App neu startest.");
+          return false;
+        }
+        try {
+          await persistLocalSnapshot();
+          return true;
+        } catch (error) {
+          showNotice(`Neustart verschoben: Änderungen noch nicht gespeichert. ${error.message}`);
+          return false;
+        }
+      }
+
       async function handleWaitingServiceWorker(registration) {
         if (!registration || !registration.waiting || updatePromptShown) return;
         if (!navigator.serviceWorker.controller) return;
@@ -2699,6 +2714,7 @@
             cancelText: "Später"
           });
           if (confirmed && registration.waiting) {
+            if (!await prepareAppReload()) return;
             updateReloadApproved = true;
             registration.waiting.postMessage({ type: "SKIP_WAITING" });
           } else {
@@ -2790,6 +2806,8 @@
         idx: 0,
         showingBack: false,
         awaitingNextTap: false,
+        pendingRating: null,
+        ratingSaveInProgress: false,
         lastRatingMessage: "",
         autoNextTimer: 0,
         stageSplashActive: false,
@@ -2833,6 +2851,8 @@
         pendingSyncWrite: false,
         localRevision: 0,
         lastSyncedRevision: 0,
+        localRestoreComplete: false,
+        localPersistenceError: "",
         suppressMutationSync: false,
         syncDeletedCardTimestamps: {}
       };
@@ -2901,12 +2921,21 @@
       function markDeletedCardTimestamp(id, deletedAt = now()) {
         const normalizedId = String(id || "").trim();
         if (!normalizedId) return;
-        state.syncDeletedCardTimestamps[normalizedId] = normalizeTimestamp(deletedAt, now());
+        const card = state.data.cards.find(item => String(item.id) === normalizedId);
+        state.syncDeletedCardTimestamps[normalizedId] = Math.max(
+          normalizeTimestamp(deletedAt, now()),
+          normalizeTimestamp(card && card.updatedAt, 0) + 1,
+          normalizeTimestamp(state.syncDeletedCardTimestamps[normalizedId], 0) + 1
+        );
       }
 
       function markCardUpdated(card, updatedAt = now()) {
         if (!card) return;
-        card.updatedAt = normalizeTimestamp(updatedAt, now());
+        card.updatedAt = Math.max(
+          normalizeTimestamp(updatedAt, now()),
+          normalizeTimestamp(card.updatedAt, 0) + 1,
+          normalizeTimestamp(state.syncDeletedCardTimestamps[card.id], 0) + 1
+        );
         clearDeletedCardTimestamp(card.id);
       }
 
@@ -3697,6 +3726,7 @@
       }
 
       function addCard(front, back, flair) {
+        if (!state.localRestoreComplete) return false;
         front = (front || "").trim();
         back = (back || "").trim();
         const normalizedFlair = normalizeCardFlair(flair, "");
@@ -3734,23 +3764,47 @@
         return targetKind === "file" ? "Datei" : "Ordner";
       }
 
-      function bumpLocalRevision() {
+      async function bumpLocalRevision() {
         if (state.suppressMutationSync) return;
         state.localRevision++;
+        state.pendingSyncWrite = true;
+        await persistLocalSnapshot();
         scheduleSyncWrite();
-        persistLocalSnapshot().catch(() => {});
-        persistSyncOutboxSnapshot().catch(() => { });
         updateAppBadge();
       }
 
       function setSyncStatus(message) {
         const node = el("syncStatus");
-        if (node) node.textContent = message;
+        if (node) node.textContent = state.localPersistenceError
+          ? `Lokal nicht gespeichert: ${state.localPersistenceError}`
+          : message;
+      }
+
+      function setSyncResultStatus(message) {
+        setSyncStatus(hasPendingSyncWork()
+          ? `${message} Weitere lokale Änderungen warten auf Synchronisierung.`
+          : message);
+      }
+
+      function setLocalDataControlsEnabled(enabled) {
+        ["btnHard", "btnOk", "btnAdd", "btnBulkAddImport", "btnEditSave", "btnEditDelete", "btnAllCardsSave", "btnImportBackup", "btnCreateBackup"].forEach(id => {
+          const button = el(id);
+          if (button) button.disabled = !enabled;
+        });
       }
 
       function requestRenderAfterDataChange() {
         if (state.view === "study") {
-          buildQueue();
+          if (state.pendingRating || state.awaitingNextTap) {
+            const currentId = String(currentCard() && currentCard().id || "");
+            const cardsById = new Map(state.data.cards.map(card => [String(card.id), card]));
+            state.queue = state.queue.map(card => cardsById.get(String(card.id))).filter(Boolean);
+            const currentIndex = state.queue.findIndex(card => String(card.id) === currentId);
+            state.idx = currentIndex >= 0 ? currentIndex : Math.max(0, Math.min(state.idx, state.queue.length - 1));
+            renderStudy();
+          } else {
+            buildQueue();
+          }
         } else if (state.view === "list") {
           renderList();
         } else {
@@ -3948,10 +4002,13 @@
         return true;
       }
 
-      function applySyncStateToLocal(syncState, options = {}) {
-        const { synced = true } = options;
-        const normalized = normalizeSyncState(syncState);
-        const changed = !areSyncStatesEqual(getLocalSyncStateSnapshot(), normalized);
+      async function applySyncStateToLocal(syncState, options = {}) {
+        const { synced = true, revision = state.localRevision } = options;
+        const acknowledgedState = normalizeSyncState(syncState);
+        const localState = getLocalSyncStateSnapshot();
+        const normalized = mergeSyncStates(localState, acknowledgedState, { preferLocalOnTie: true });
+        const previousSyncedRevision = state.lastSyncedRevision;
+        const changed = !areSyncStatesEqual(localState, normalized);
         if (changed) {
           state.suppressMutationSync = true;
           state.data.cards = normalized.cards;
@@ -3959,29 +4016,26 @@
           state.suppressMutationSync = false;
           state.localRevision++;
         }
-        if (synced) {
+        if (synced && areSyncStatesEqual(normalized, acknowledgedState)) {
           state.lastSyncedRevision = state.localRevision;
           state.pendingSyncWrite = false;
         } else {
-          if (changed) {
-            state.lastSyncedRevision = 0;
-            state.pendingSyncWrite = true;
+          if (synced) {
+            state.lastSyncedRevision = Math.max(previousSyncedRevision,
+              Math.min(Number(revision) || 0, state.localRevision - 1));
           }
-        }
-        const snapshotRevision = state.localRevision;
-        const snapshotPersisted = persistLocalSnapshot();
-        if (synced) {
-          snapshotPersisted.then(() => {
-            if (state.localRevision === snapshotRevision && !state.pendingSyncWrite) {
-              return clearSyncOutboxSnapshot();
-            }
-          }).catch(() => {});
-        } else {
-          snapshotPersisted.catch(() => {});
+          state.pendingSyncWrite = true;
         }
         if (changed) {
           requestRenderAfterDataChange();
           updateAppBadge();
+        }
+        try {
+          await persistLocalSnapshot();
+        } catch (error) {
+          state.lastSyncedRevision = Math.min(state.lastSyncedRevision, previousSyncedRevision);
+          state.pendingSyncWrite = true;
+          throw error;
         }
       }
 
@@ -4019,7 +4073,8 @@
         input.click();
       }
 
-      function applyImportedBackupState(syncState) {
+      async function applyImportedBackupState(syncState) {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const normalized = normalizeSyncState(syncState);
         state.suppressMutationSync = true;
         state.data.cards = normalized.cards;
@@ -4027,18 +4082,19 @@
         state.suppressMutationSync = false;
         state.lastSyncedRevision = 0;
         state.pendingSyncWrite = true;
-        bumpLocalRevision();
+        await bumpLocalRevision();
         requestRenderAfterDataChange();
       }
 
       async function handleDatabaseBackupImportChange(event) {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const input = event && event.target;
         const file = input && input.files && input.files[0] ? input.files[0] : null;
         if (!file) return;
         try {
           const text = await file.text();
           const importedState = parseSyncPayload(text);
-          applyImportedBackupState(importedState);
+          await applyImportedBackupState(importedState);
           const count = importedState.cards.length;
           setSyncStatus(`Datenbank-Backup importiert: ${count} ${count === 1 ? "Karte" : "Karten"} geladen.`);
           showNotice(`Datenbank-Backup importiert: ${count} ${count === 1 ? "Karte" : "Karten"} geladen.`);
@@ -4099,66 +4155,87 @@
         db.close();
       }
 
+      async function writeLocalSnapshot(snapshot) {
+        const db = await openSyncDb();
+        try {
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(SYNC_DB_STORE, "readwrite");
+            const store = tx.objectStore(SYNC_DB_STORE);
+            store.put(snapshot, SYNC_LOCAL_SNAPSHOT_KEY);
+            if (snapshot.pendingSyncWrite || snapshot.revision !== snapshot.lastSyncedRevision) {
+              store.put(snapshot, SYNC_OUTBOX_KEY);
+            } else {
+              const request = store.get(SYNC_OUTBOX_KEY);
+              request.onsuccess = () => {
+                const outbox = request.result;
+                if (!outbox || (Number(outbox.revision) || 0) <= snapshot.lastSyncedRevision) {
+                  store.delete(SYNC_OUTBOX_KEY);
+                }
+              };
+            }
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error || new Error("Lokales Speichern fehlgeschlagen."));
+            tx.onabort = () => reject(tx.error || new Error("Lokales Speichern abgebrochen."));
+          });
+        } finally {
+          db.close();
+        }
+      }
+
       function persistLocalSnapshot() {
         const localSyncState = getLocalSyncStateSnapshot();
         const snapshot = {
           revision: Number(state.localRevision) || 0,
           lastSyncedRevision: Number(state.lastSyncedRevision) || 0,
+          pendingSyncWrite: state.pendingSyncWrite,
           cards: localSyncState.cards,
           deletedCardIds: localSyncState.deletedCardIds,
           savedAt: Date.now()
         };
         localSnapshotPersistPromise = localSnapshotPersistPromise.catch(() => {})
-          .then(() => idbSet(SYNC_LOCAL_SNAPSHOT_KEY, snapshot));
+          .then(() => writeLocalSnapshot(snapshot))
+          .then(() => {
+            const recovered = !!state.localPersistenceError;
+            state.localPersistenceError = "";
+            if (recovered) setSyncStatus("Lokal gespeichert.");
+          })
+          .catch(error => {
+            state.localPersistenceError = error.message || "Lokales Speichern fehlgeschlagen.";
+            setSyncStatus(`Lokal nicht gespeichert: ${state.localPersistenceError}`);
+            throw error;
+          });
         return localSnapshotPersistPromise;
       }
 
       async function restoreLocalSnapshot() {
         const snapshot = await idbGet(SYNC_LOCAL_SNAPSHOT_KEY);
-        if (!snapshot || !Array.isArray(snapshot.cards)) return false;
+        if (!snapshot) return false;
+        if (!Array.isArray(snapshot.cards)) throw new Error("Gespeicherter lokaler Lernstand ist ungültig.");
         const restoredState = normalizeSyncState(snapshot);
         state.data.cards = restoredState.cards;
         state.syncDeletedCardTimestamps = restoredState.deletedCardIds;
         state.localRevision = Math.max(0, Number(snapshot.revision) || 0);
         state.lastSyncedRevision = Math.min(state.localRevision,
           Math.max(0, Number(snapshot.lastSyncedRevision) || 0));
-        state.pendingSyncWrite = state.lastSyncedRevision !== state.localRevision;
+        state.pendingSyncWrite = !!snapshot.pendingSyncWrite || state.lastSyncedRevision !== state.localRevision;
         return true;
-      }
-
-      async function persistSyncOutboxSnapshot() {
-        if (!isAnySyncActive()) return;
-        const localSyncState = getLocalSyncStateSnapshot();
-        const snapshot = {
-          revision: Number(state.localRevision) || 0,
-          cards: localSyncState.cards,
-          deletedCardIds: localSyncState.deletedCardIds,
-          savedAt: Date.now()
-        };
-        await idbSet(SYNC_OUTBOX_KEY, snapshot);
-      }
-
-      async function clearSyncOutboxSnapshot() {
-        await idbDelete(SYNC_OUTBOX_KEY);
       }
 
       async function restoreSyncOutboxSnapshot() {
         const snapshot = await idbGet(SYNC_OUTBOX_KEY);
-        if (!snapshot || !Array.isArray(snapshot.cards)) return false;
-        const restoredState = normalizeSyncState({
-          cards: snapshot.cards,
-          deletedCardIds: snapshot.deletedCardIds
-        });
-        if (restoredState.cards.length === 0 && Object.keys(restoredState.deletedCardIds).length === 0) return false;
+        if (!snapshot) return false;
+        if (!Array.isArray(snapshot.cards)) throw new Error("Gespeicherte ungesendete Änderungen sind ungültig.");
+        const snapshotRevision = Math.max(0, Number(snapshot.revision) || 0);
+        if (snapshotRevision > 0 && snapshotRevision <= state.lastSyncedRevision) return false;
+        const localState = getLocalSyncStateSnapshot();
+        const restoredState = mergeSyncStates(localState, snapshot, { preferLocalOnTie: true });
+        const changed = !areSyncStatesEqual(localState, restoredState);
         state.suppressMutationSync = true;
         state.data.cards = restoredState.cards;
         state.syncDeletedCardTimestamps = restoredState.deletedCardIds;
         state.suppressMutationSync = false;
-        state.localRevision = Math.max(1, Number(snapshot.revision) || 0, state.localRevision);
-        state.lastSyncedRevision = 0;
+        state.localRevision = Math.max(1, snapshotRevision, state.localRevision + (changed ? 1 : 0));
         state.pendingSyncWrite = true;
-        requestRenderAfterDataChange();
-        updateAppBadge();
         setSyncStatus("Datenbank: Ungesendete lokale Änderungen wiederhergestellt, synchronisiere...");
         return true;
       }
@@ -4191,39 +4268,14 @@
       }
 
       function flushSyncOnPageHide() {
-        if (!isAnySyncActive()) return;
+        if (!state.localRestoreComplete) return;
         if (!hasPendingSyncWork()) return;
         clearSyncRetryTimer();
         if (state.syncWriteTimer) {
           clearTimeout(state.syncWriteTimer);
           state.syncWriteTimer = 0;
         }
-        persistSyncOutboxSnapshot().catch(() => { });
-
-        if (!isFirebaseSyncActive()) return;
-        const config = normalizeFirebaseConfig(state.syncFirebaseConfig);
-        if (validateFirebaseConfig(config)) return;
-        if (!state.syncFirebaseIdToken || now() >= state.syncFirebaseTokenExpiresAt) return;
-        try {
-          const payload = stringifySyncPayload();
-          const url = buildFirebaseUrl(config, state.syncFirebaseIdToken);
-          if (navigator.sendBeacon) {
-            const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
-            navigator.sendBeacon(url, blob);
-            return;
-          }
-          fetch(url, {
-            method: "PUT",
-            headers: {
-              "Content-Type": "application/json;charset=utf-8",
-              ...(state.syncFirebaseEtag ? { "If-Match": state.syncFirebaseEtag } : {})
-            },
-            body: payload,
-            keepalive: true
-          }).catch(() => { });
-        } catch (e) {
-          // ignore best-effort errors on pagehide
-        }
+        persistLocalSnapshot().catch(() => {});
       }
 
       async function ensureHandlePermission(handle, mode) {
@@ -4239,7 +4291,7 @@
       async function readSyncStateFromSyncFileHandle(handle) {
         const file = await handle.getFile();
         const text = await file.text();
-        return parseSyncPayload(text);
+        return text.trim() ? parseSyncPayload(text) : null;
       }
 
       async function writeSyncStateToSyncFileHandle(handle, syncState = getLocalSyncStateSnapshot()) {
@@ -4808,17 +4860,19 @@
           setSyncStatus(`Datenbank (Lokal): Datei fehlt. Leere Datenbank wird im ${getLocalSyncTargetLabel().toLowerCase()} angelegt...`);
           return pushToLocalFolder({ silent, force: true });
         }
+        const revision = state.localRevision;
         const importedState = await readSyncStateFromSyncFileHandle(handle);
-        applySyncStateToLocal(importedState, { synced: true });
+        if (!importedState) return pushToLocalFolder({ silent, force: true });
+        await applySyncStateToLocal(importedState, { synced: true, revision });
         const count = importedState.cards.length;
-        setSyncStatus(`Datenbank (Lokal, ${targetLabel}): ${count} ${count === 1 ? "Karte" : "Karten"} geladen.`);
+        setSyncResultStatus(`Datenbank (Lokal, ${targetLabel}): ${count} ${count === 1 ? "Karte" : "Karten"} geladen.`);
         return true;
       }
 
       async function pushToLocalFolder(options = {}) {
         const { silent = false, force = false } = options;
         if (!isLocalSyncActive()) return false;
-        if (!force && state.lastSyncedRevision === state.localRevision) return true;
+        if (!force && !hasPendingSyncWork()) return true;
         const rootHandle = state.syncLocalFileHandle || state.syncLocalDirectoryHandle;
         const targetLabel = getLocalSyncTargetLabel();
         const granted = await ensureHandlePermission(rootHandle, "readwrite");
@@ -4827,26 +4881,19 @@
           setSyncStatus(`Datenbank (Lokal): Schreibzugriff auf ${targetLabel.toLowerCase()} verweigert.`);
           return false;
         }
-        const handle = await getLocalSyncFileHandle({ create: true });
+        const existingHandle = await getLocalSyncFileHandle({ create: false });
+        const remoteState = existingHandle ? await readSyncStateFromSyncFileHandle(existingHandle) : null;
+        const handle = existingHandle || await getLocalSyncFileHandle({ create: true });
         if (!handle) {
           if (!silent) showNotice(`Kein Schreibzugriff auf die ausgewählte ${targetLabel}.`);
           setSyncStatus(`Datenbank (Lokal): Schreibzugriff auf ${targetLabel.toLowerCase()} verweigert.`);
           return false;
         }
-        let mergedState = getLocalSyncStateSnapshot();
-        try {
-          const existingHandle = await getLocalSyncFileHandle({ create: false });
-          if (existingHandle) {
-            const remoteState = await readSyncStateFromSyncFileHandle(existingHandle);
-            mergedState = mergeSyncStates(getLocalSyncStateSnapshot(), remoteState, { preferLocalOnTie: true });
-          }
-        } catch (e) {
-          // keep local snapshot if remote cannot be read
-        }
-
+        const revision = state.localRevision;
+        const mergedState = mergeSyncStates(getLocalSyncStateSnapshot(), remoteState || {}, { preferLocalOnTie: true });
         await writeSyncStateToSyncFileHandle(handle, mergedState);
-        applySyncStateToLocal(mergedState, { synced: true });
-        setSyncStatus(`Datenbank (Lokal, ${targetLabel}): ${state.data.cards.length} Karte(n) gespeichert.`);
+        await applySyncStateToLocal(mergedState, { synced: true, revision });
+        setSyncResultStatus(`Datenbank (Lokal, ${targetLabel}): ${state.data.cards.length} Karte(n) gespeichert.`);
         return true;
       }
 
@@ -4892,23 +4939,24 @@
           throw new Error(validationError);
         }
         const idToken = await ensureFirebaseIdToken(config);
+        const revision = state.localRevision;
         const remote = await fetchFirebaseSyncState(config, idToken);
         state.syncFirebaseEtag = remote.etag;
         if (!remote.exists) {
           setSyncStatus("Datenbank (Firebase): Kein Eintrag gefunden. Leere Datenbank wird angelegt...");
           return pushToFirebase({ silent, force: true });
         }
-        applySyncStateToLocal(remote.syncState, { synced: true });
+        await applySyncStateToLocal(remote.syncState, { synced: true, revision });
         const count = remote.syncState.cards.length;
         const noun = count === 1 ? "Karte" : "Karten";
-        setSyncStatus(`Datenbank (Firebase): ${count} ${noun} geladen.`);
+        setSyncResultStatus(`Datenbank (Firebase): ${count} ${noun} geladen.`);
         return true;
       }
 
       async function pushToFirebase(options = {}) {
         const { silent = false, force = false } = options;
         if (!isFirebaseSyncActive()) return false;
-        if (!force && state.lastSyncedRevision === state.localRevision) return true;
+        if (!force && !hasPendingSyncWork()) return true;
 
         const config = normalizeFirebaseConfig(state.syncFirebaseConfig);
         const validationError = validateFirebaseConfig(config);
@@ -4920,15 +4968,17 @@
 
         for (let attempt = 0; attempt <= SYNC_FIREBASE_CONFLICT_RETRY_LIMIT; attempt++) {
           const remote = await fetchFirebaseSyncState(config, idToken);
+          if (!remote.etag) {
+            throw new Error("Die Datenbank konnte den aktuellen Stand nicht bestätigen. Änderungen bleiben lokal gespeichert.");
+          }
+          const revision = state.localRevision;
           const mergedState = mergeSyncStates(getLocalSyncStateSnapshot(), remote.syncState, {
             preferLocalOnTie: true
           });
           const headers = buildFirebaseHeaders({
             "Content-Type": "application/json;charset=utf-8"
           });
-          if (remote.etag) {
-            headers["If-Match"] = remote.etag;
-          }
+          headers["If-Match"] = remote.etag;
           const response = await firebaseFetch(buildFirebaseUrl(config, idToken), {
             method: "PUT",
             headers,
@@ -4948,9 +4998,9 @@
             throw new Error(`Firebase-Upload fehlgeschlagen (HTTP ${response.status}).`);
           }
 
-          applySyncStateToLocal(mergedState, { synced: true });
+          await applySyncStateToLocal(mergedState, { synced: true, revision });
           state.syncFirebaseEtag = response.headers.get("etag") || remote.etag || state.syncFirebaseEtag;
-          setSyncStatus(`Datenbank (Firebase): ${state.data.cards.length} Karte(n) gespeichert.`);
+          setSyncResultStatus(`Datenbank (Firebase): ${state.data.cards.length} Karte(n) gespeichert.`);
           return true;
         }
 
@@ -4971,17 +5021,19 @@
 
       async function runAutoSync(options = {}) {
         const { silent = false } = options;
-        if (!isAnySyncActive() || state.syncInProgress) return;
+        if (!state.localRestoreComplete || state.pendingRating || !isAnySyncActive() || state.syncInProgress) return;
         state.syncInProgress = true;
         let needsFollowUpSync = false;
         let syncFailed = false;
         try {
-          if (state.pendingSyncWrite || state.lastSyncedRevision !== state.localRevision) {
-            state.pendingSyncWrite = false;
-            await pushToActiveSync({ silent });
+          await persistLocalSnapshot();
+          let success;
+          if (hasPendingSyncWork()) {
+            success = await pushToActiveSync({ silent });
           } else {
-            await pullFromActiveSync({ silent });
+            success = await pullFromActiveSync({ silent });
           }
+          if (!success) throw new Error("Synchronisierung nicht abgeschlossen. Lokale Änderungen bleiben gespeichert.");
         } catch (err) {
           syncFailed = true;
           if (!silent) showNotice(`Datenbank fehlgeschlagen: ${err.message}`);
@@ -5009,7 +5061,7 @@
       }
 
       function scheduleSyncWrite() {
-        if (!isAnySyncActive()) return;
+        if (!state.localRestoreComplete || !isAnySyncActive()) return;
         clearSyncRetryTimer();
         state.pendingSyncWrite = true;
         if (state.syncWriteTimer) clearTimeout(state.syncWriteTimer);
@@ -5415,6 +5467,7 @@
           }
         } catch (e) {
           setSyncStatus("Datenbank: Konnte gespeicherte Synchronisierung nicht laden.");
+          throw e;
         }
         setSyncModeUi(state.syncMode);
       }
@@ -5447,8 +5500,14 @@
         }
 
         state.queue = selected;
+        if (state.pendingRating) {
+          const pendingCard = state.data.cards.find(card => String(card.id) === state.pendingRating.cardId);
+          if (pendingCard) {
+            state.queue = [pendingCard, ...selected.filter(card => String(card.id) !== state.pendingRating.cardId)];
+          }
+        }
         state.idx = 0;
-        state.showingBack = false;
+        state.showingBack = !!state.pendingRating;
         state.awaitingNextTap = false;
         state.lastRatingMessage = "";
         state.stageSplashActive = false;
@@ -5507,15 +5566,16 @@
         const normalizedId = String(id || "").trim();
         if (!normalizedId) return false;
         const beforeCount = state.data.cards.length;
-        state.data.cards = state.data.cards.filter((c) => String(c && c.id || "") !== normalizedId);
-        const removed = state.data.cards.length !== beforeCount;
-        if (removed) {
+        if (state.data.cards.some(card => String(card.id) === normalizedId)) {
           markDeletedCardTimestamp(normalizedId, deletedAt);
         }
+        state.data.cards = state.data.cards.filter((c) => String(c && c.id || "") !== normalizedId);
+        const removed = state.data.cards.length !== beforeCount;
         return removed;
       }
 
       function flip() {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const card = currentCard();
         if (!card) {
           const dueCount = formatDueCount();
@@ -5532,13 +5592,13 @@
         animateCardFlip();
       }
 
-      function rate(kind) {
+      async function rate(kind) {
+        if (!state.localRestoreComplete || state.ratingSaveInProgress || (kind !== "hard" && kind !== "ok")) return;
         const card = currentCard();
         if (!card || !state.showingBack || state.awaitingNextTap) return;
+        if (state.pendingRating && state.pendingRating.cardId !== String(card.id)) return;
         let mutated = false;
-
-        if (!state.randomPractice) {
-          // stage update rules (simple and robust)
+        if (!state.pendingRating && !state.randomPractice) {
           if (kind === "hard") {
             card.stage = 0;
           } else if (kind === "ok") {
@@ -5548,18 +5608,47 @@
           const days = STAGES[card.stage] ?? 7;
           card.dueAt = now() + (days * dayMs);
           markCardUpdated(card);
-          state.lastRatingMessage = `Neue Stufe: ${(card.stage || 0) + 1}`;
           mutated = true;
-        } else {
-          state.lastRatingMessage = `Stufe bleibt: ${(card.stage || 0) + 1}`;
         }
-        state.pendingCompletedCardId = String(card.id || "");
+        if (!state.pendingRating) {
+          state.pendingRating = {
+            cardId: String(card.id),
+            kind,
+            needsPersistence: mutated,
+            message: `${state.randomPractice ? "Stufe bleibt" : "Neue Stufe"}: ${(card.stage || 0) + 1}`
+          };
+        }
+        const rating = state.pendingRating;
+        state.ratingSaveInProgress = true;
+        clearAutoNextTimer();
+        renderStudy();
+        try {
+          if (mutated) {
+            await bumpLocalRevision();
+          } else if (rating.needsPersistence) {
+            await persistLocalSnapshot();
+          }
+        } catch (error) {
+          state.ratingSaveInProgress = false;
+          renderStudy();
+          showNotice(`Bewertung noch nicht gespeichert: ${error.message}. Tippe erneut auf dieselbe Bewertung, um das Speichern zu wiederholen.`);
+          return;
+        }
+        state.ratingSaveInProgress = false;
+        state.pendingRating = null;
+        state.pendingCompletedCardId = rating.cardId;
+        state.lastRatingMessage = rating.message;
+        if (state.view !== "study" || String(currentCard() && currentCard().id || "") !== rating.cardId) {
+          completePendingCardAfterAdvance();
+          requestRenderAfterDataChange();
+          if (hasPendingSyncWork()) scheduleSyncWrite();
+          return;
+        }
         updateLastCompletedCardButton();
         state.awaitingNextTap = true;
         state.stageSplashActive = true;
-        if (mutated) bumpLocalRevision();
         renderStudy();
-        clearAutoNextTimer();
+        if (hasPendingSyncWork()) scheduleSyncWrite();
         state.autoNextTimer = setTimeout(() => {
           state.autoNextTimer = 0;
           next();
@@ -5567,6 +5656,7 @@
       }
 
       function next() {
+        if (state.pendingRating) return;
         clearAutoNextTimer();
         state.showingBack = false;
         state.awaitingNextTap = false;
@@ -5672,6 +5762,7 @@
       }
 
       let allCardsDraft = null;
+      let allCardsOriginalIds = new Set();
       let allCardsSearchQuery = "";
 
       function buildAllCardsDraft() {
@@ -5726,6 +5817,7 @@
         const dialog = el("allCardsDialog");
         if (!dialog) return;
         allCardsDraft = buildAllCardsDraft();
+        allCardsOriginalIds = new Set(allCardsDraft.map(card => String(card.id)));
         allCardsSearchQuery = "";
         const searchInput = el("allCardsSearch");
         if (searchInput) searchInput.value = "";
@@ -5868,11 +5960,12 @@
       }
 
       async function saveAllCardsDialog() {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const draft = Array.isArray(allCardsDraft) ? allCardsDraft : [];
+        const originalIds = new Set(allCardsOriginalIds);
         const nextCards = [];
         const previousById = new Map(state.data.cards.map((card) => [String(card.id || ""), card]));
         const nextIds = new Set();
-        const changedAt = now();
 
         for (let i = 0; i < draft.length; i++) {
           const card = draft[i];
@@ -5890,21 +5983,10 @@
             front,
             back,
             flair,
-            stage: Math.max(0, Math.min(STAGES.length - 1, Number(card.stage) || 0)),
-            dueAt: Number(card.dueAt) || 0,
-            updatedAt: normalizeTimestamp(card.updatedAt, 0)
+            stage: Number(previous && previous.stage) || 0,
+            dueAt: Number(previous && previous.dueAt) || 0,
+            updatedAt: normalizeTimestamp(previous && previous.updatedAt, 0)
           };
-          const changed = !previous ||
-            String(previous.front || "") !== nextCard.front ||
-            String(previous.back || "") !== nextCard.back ||
-            normalizeCardFlair(previous.flair) !== nextCard.flair ||
-            (Number(previous.stage) || 0) !== nextCard.stage ||
-            (Number(previous.dueAt) || 0) !== nextCard.dueAt;
-          if (changed) {
-            nextCard.updatedAt = changedAt;
-          } else {
-            nextCard.updatedAt = normalizeTimestamp(previous.updatedAt, nextCard.updatedAt);
-          }
           nextIds.add(id);
           nextCards.push(nextCard);
         }
@@ -5934,24 +6016,42 @@
           return;
         }
 
-        for (const id of nextIds) {
-          clearDeletedCardTimestamp(id);
+        const currentById = new Map(state.data.cards.map(card => [String(card.id), card]));
+        const savedCards = [];
+        for (const nextCard of nextCards) {
+          const current = currentById.get(nextCard.id);
+          if (!current) continue;
+          nextCard.stage = current.stage;
+          nextCard.dueAt = current.dueAt;
+          nextCard.updatedAt = current.updatedAt;
+          if (nextCard.front !== current.front || nextCard.back !== current.back || nextCard.flair !== current.flair) {
+            markCardUpdated(nextCard);
+          }
+          savedCards.push(nextCard);
         }
-
         for (const prevCard of state.data.cards) {
           const prevId = String(prevCard && prevCard.id || "").trim();
-          if (!prevId || nextIds.has(prevId)) continue;
-          markDeletedCardTimestamp(prevId, changedAt);
+          if (!originalIds.has(prevId)) {
+            savedCards.push(prevCard);
+          } else if (!nextIds.has(prevId)) {
+            markDeletedCardTimestamp(prevId);
+          }
         }
 
-        state.data.cards = nextCards;
-        bumpLocalRevision();
+        state.data.cards = savedCards;
+        try {
+          await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Änderungen noch nicht gespeichert: ${error.message}`);
+          return;
+        }
         requestRenderAfterDataChange();
         closeAllCardsDialog();
       }
 
       async function saveEditDialog() {
-        const card = getEditingCard();
+        if (!state.localRestoreComplete || state.pendingRating) return;
+        let card = getEditingCard();
         if (!card) { closeEditDialog(); return; }
         const nextFront = el("editFront").value.trim();
         const nextBack = el("editBack").value.trim();
@@ -5971,26 +6071,39 @@
         })) {
           return;
         }
+        card = getEditingCard();
+        if (!card) { closeEditDialog(); return; }
         card.front = nextFront;
         card.back = nextBack;
         card.flair = nextFlair;
         markCardUpdated(card);
         const renderAllCards = syncCardToAllCardsDraft(card);
-        bumpLocalRevision();
+        try {
+          await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Änderungen noch nicht gespeichert: ${error.message}`);
+          return;
+        }
         closeEditDialog();
         renderStudy();
         if (state.view === "list") renderList();
         if (renderAllCards && el("allCardsDialog").open) renderAllCardsDialog();
       }
 
-      function deleteFromEditDialog() {
+      async function deleteFromEditDialog() {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const card = getEditingCard();
         if (!card) { closeEditDialog(); return; }
         if (!confirm("Karte wirklich löschen?")) return;
         const renderAllCards = removeCardFromAllCardsDraft(card.id);
         deleteCard(card.id);
         updateLastCompletedCardButton();
-        bumpLocalRevision();
+        try {
+          await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Löschung noch nicht gespeichert: ${error.message}`);
+          return;
+        }
         closeEditDialog();
         buildQueue();
         if (state.view === "list") renderList();
@@ -6295,12 +6408,16 @@
         const card = currentCard();
         const dueCount = formatDueCount();
         const studyCardsCount = getCardsForStudyMode(state.data.cards).length;
-        const ratingEnabled = !!card && state.showingBack && !state.awaitingNextTap;
+        const ratingEnabled = state.localRestoreComplete && !!card && state.showingBack && !state.awaitingNextTap && !state.ratingSaveInProgress;
         const speakBtn = el("btnSpeak");
         updateDuePill();
         renderFlashFlairToggles(card ? card.flair : null);
-        el("btnHard").disabled = !ratingEnabled;
-        el("btnOk").disabled = !ratingEnabled;
+        el("btnHard").disabled = !ratingEnabled || !!(state.pendingRating && state.pendingRating.kind !== "hard");
+        el("btnOk").disabled = !ratingEnabled || !!(state.pendingRating && state.pendingRating.kind !== "ok");
+        el("btnHard").title = state.pendingRating && state.pendingRating.kind === "hard" ? "Speichern wiederholen" : "Schwierig";
+        el("btnOk").title = state.pendingRating && state.pendingRating.kind === "ok" ? "Speichern wiederholen" : "Okay";
+        el("btnHard").setAttribute("aria-label", el("btnHard").title);
+        el("btnOk").setAttribute("aria-label", el("btnOk").title);
 
         if (!card) {
           if (state.data.cards.length > 0 && studyCardsCount === 0) {
@@ -6375,6 +6492,7 @@
       }
 
       async function submitAddCard() {
+        if (!state.localRestoreComplete || state.pendingRating) return;
         const front = el("addFront").value.trim();
         const back = el("addBack").value.trim();
         const flair = getFlairChoiceValue(el("addFlairChoice"));
@@ -6395,7 +6513,12 @@
         const ok = addCard(front, back, normalizedFlair);
         if (!ok) { alert("Bitte Vorderseite, Rückseite und Flair ausfüllen."); return; }
         state.randomPractice = false;
-        bumpLocalRevision();
+        try {
+          await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Vokabel noch nicht gespeichert: ${error.message}`);
+          return;
+        }
         el("addFront").value = "";
         el("addBack").value = "";
         setFlairChoiceValue(el("addFlairChoice"), DEFAULT_CARD_FLAIR);
@@ -6462,6 +6585,7 @@
       }
 
       async function importJSON(input, options = {}) {
+        if (!state.localRestoreComplete || state.pendingRating) return null;
         const { stayInList = false } = options;
         let arr;
         try {
@@ -6515,8 +6639,13 @@
             added++;
           }
         }
+        try {
+          if (added > 0) await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Import noch nicht gespeichert: ${error.message}`);
+          return null;
+        }
         showNotice(`Import: ${added} Karte(n) hinzugefügt.`);
-        if (added > 0) bumpLocalRevision();
         if (stayInList) {
           renderList();
           return added;
@@ -6735,6 +6864,7 @@
       });
       el("allCardsDialog").addEventListener("close", () => {
         allCardsDraft = null;
+        allCardsOriginalIds = new Set();
         allCardsSearchQuery = "";
       });
       el("firebaseDialog").addEventListener("cancel", (event) => {
@@ -6812,7 +6942,10 @@
       });
 
       document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState !== "visible") return;
+        if (document.visibilityState !== "visible") {
+          flushSyncOnPageHide();
+          return;
+        }
         runAutoSync({ silent: true });
         registerBadgeBackgroundRefresh();
         scheduleBadgeBackgroundRefreshRetry();
@@ -6857,6 +6990,7 @@
                 return;
               }
               if (updateReloadApproved) {
+                if (!await prepareAppReload()) return;
                 reloadedOnControllerChange = true;
                 window.location.reload();
                 return;
@@ -6867,6 +7001,7 @@
                 cancelText: "Später"
               });
               if (!confirmed) return;
+              if (!await prepareAppReload()) return;
               reloadedOnControllerChange = true;
               window.location.reload();
             });
@@ -6941,9 +7076,19 @@
         wireFlashFlairModeControl();
         renderFlashFlairToggles();
         configureSyncUi();
-        await restoreSyncConfig();
-        await restoreLocalSnapshot();
-        await restoreSyncOutboxSnapshot();
+        setLocalDataControlsEnabled(false);
+        try {
+          await restoreSyncConfig();
+          await restoreLocalSnapshot();
+          await restoreSyncOutboxSnapshot();
+          await persistLocalSnapshot();
+          state.localRestoreComplete = true;
+          setLocalDataControlsEnabled(true);
+        } catch (error) {
+          setSyncStatus(`Lernstand konnte nicht wiederhergestellt werden: ${error.message}`);
+          showNotice("Der gespeicherte Lernstand konnte nicht geladen werden. Bitte öffne die App erneut. Lernen und Synchronisierung bleiben bis dahin angehalten.");
+          return;
+        }
         primeSpeechVoices();
         initGlassPointerMotion();
 
