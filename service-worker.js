@@ -1,4 +1,4 @@
-const VERSION = 26;
+const VERSION = 29;
 const CACHE_NAME = `vokabeln-v${VERSION}`;
 const APP_SHELL_URL = new URL("./index.html", self.location.href).href;
 const ASSETS = [

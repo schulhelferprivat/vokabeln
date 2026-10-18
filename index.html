@@ -442,6 +442,16 @@
       transform: scale(.96);
     }
 
+    .headerBackSeg {
+      flex: 0 0 auto;
+    }
+
+    .seg button:disabled {
+      opacity: .35;
+      cursor: default;
+      transform: none;
+    }
+
     .seg button:focus-visible,
     .btn:focus-visible,
     .flashFlairSlider:focus-visible,
@@ -1578,8 +1588,24 @@
       font-size: clamp(22px, 3vw, 30px);
     }
 
-    .editFlairField label {
+    .editMetaFields {
+      display: flex;
+      align-items: flex-end;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .editFlairField label,
+    .editStageField label {
       margin-bottom: 4px;
+    }
+
+    #editStage {
+      width: auto;
+      min-width: 170px;
+      height: 52px;
+      padding-top: 0;
+      padding-bottom: 0;
     }
 
     .editFields {
@@ -2096,6 +2122,15 @@
 <body>
   <div class="app">
     <header>
+      <div class="seg headerBackSeg">
+        <button type="button" id="btnUndoRating" class="tabIcon" aria-label="Letzte Bewertung rückgängig"
+          title="Zurück zur letzten Karte" disabled>
+          <svg class="tabGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <path d="M9 14L4 9l5-5"></path>
+            <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"></path>
+          </svg>
+        </button>
+      </div>
       <div class="title">
         <h1 id="appTitle">Vokabeltrainer</h1>
         <p class="sub" id="duePill">Fällige Vokabeln: 0</p>
@@ -2243,11 +2278,17 @@
   <dialog id="editDialog">
     <div class="editDialogHeader">
       <h2 class="dialogTitle">Karte bearbeiten</h2>
-      <div class="editFlairField">
-        <label>Flair</label>
-        <div id="editFlairChoice" class="flairChoice" role="group" aria-label="Flair wählen">
-          <button type="button" class="flairBtn active" data-flair="🎓" aria-label="Flair 🎓">🎓</button>
-          <button type="button" class="flairBtn flag-us" data-flair="🇺🇸" aria-label="Flair US-Flagge"></button>
+      <div class="editMetaFields">
+        <div class="editFlairField">
+          <label>Flair</label>
+          <div id="editFlairChoice" class="flairChoice" role="group" aria-label="Flair wählen">
+            <button type="button" class="flairBtn active" data-flair="🎓" aria-label="Flair 🎓">🎓</button>
+            <button type="button" class="flairBtn flag-us" data-flair="🇺🇸" aria-label="Flair US-Flagge"></button>
+          </div>
+        </div>
+        <div class="editStageField">
+          <label for="editStage">Stufe</label>
+          <select id="editStage"></select>
         </div>
       </div>
     </div>
@@ -2729,6 +2770,9 @@
 
       // Simple spaced repetition intervals (days) by "box"/stage
       const STAGES = [0, 1, 3, 7, 14, 30, 60, 120, 240, 365, 730]; // stage 0 means new; next due = now
+      const SMOOTHING_MIN_STAGE = 3;
+      const SMOOTHING_MAX_PULL_DAYS = 3;
+      const SMOOTHING_TOLERANCE = 3;
       const CARD_FLAIRS = ["🎓", "🇺🇸"];
       const DEFAULT_CARD_FLAIR = CARD_FLAIRS[0];
       const createDefaultStudyFlairSelection = () => CARD_FLAIRS.reduce((selection, flair) => {
@@ -2814,6 +2858,7 @@
         editingCardId: null,
         pendingCompletedCardId: null,
         lastCompletedCardId: null,
+        undoRating: null,
         promptFront: true,
         studyFlairSelection: createDefaultStudyFlairSelection(),
         randomPractice: false,
@@ -5472,14 +5517,74 @@
         setSyncModeUi(state.syncMode);
       }
 
-      function isDue(card) {
-        return (card.dueAt || 0) <= now();
+      function getLocalDayStarts(timestamp, count) {
+        const base = new Date(timestamp);
+        const starts = [];
+        for (let i = 0; i < count; i++) {
+          starts.push(new Date(base.getFullYear(), base.getMonth(), base.getDate() + i).getTime());
+        }
+        return starts;
+      }
+
+      function getSmoothingMaxPullDays(stage) {
+        const normalized = normalizeCardStage(stage);
+        if (normalized < SMOOTHING_MIN_STAGE) return 0;
+        return Math.min(SMOOTHING_MAX_PULL_DAYS, 1 + Math.floor((normalized - SMOOTHING_MIN_STAGE) / 2));
+      }
+
+      function wasReviewedSince(card, dayStart) {
+        const dueAt = Number(card && card.dueAt) || 0;
+        if (dueAt <= 0) return false;
+        const intervalMs = (STAGES[normalizeCardStage(card.stage)] || 0) * dayMs;
+        return dueAt - intervalMs >= dayStart;
+      }
+
+      function computeSmoothingPullIds(cards = state.data.cards, timestamp = now()) {
+        const pulledIds = new Set();
+        if (!Array.isArray(cards) || cards.length === 0) return pulledIds;
+        const dayStarts = getLocalDayStarts(timestamp, SMOOTHING_MAX_PULL_DAYS + 2);
+        const loads = new Array(SMOOTHING_MAX_PULL_DAYS + 1).fill(0);
+        const candidates = loads.map(() => []);
+        for (const card of cards) {
+          if (!card) continue;
+          const dueAt = Number(card.dueAt) || 0;
+          if (dueAt < dayStarts[1] || wasReviewedSince(card, dayStarts[0])) loads[0]++;
+          for (let day = 1; day <= SMOOTHING_MAX_PULL_DAYS; day++) {
+            if (dueAt < dayStarts[day] || dueAt >= dayStarts[day + 1]) continue;
+            loads[day]++;
+            if (getSmoothingMaxPullDays(card.stage) >= day) candidates[day].push(card);
+            break;
+          }
+        }
+        candidates.forEach((list) => list.sort((a, b) =>
+          normalizeCardStage(b.stage) - normalizeCardStage(a.stage)
+          || (Number(a.dueAt) || 0) - (Number(b.dueAt) || 0)
+          || String(a.id).localeCompare(String(b.id))));
+        const nextIndex = candidates.map(() => 0);
+        while (true) {
+          let bestDay = 0;
+          for (let day = 1; day <= SMOOTHING_MAX_PULL_DAYS; day++) {
+            if (nextIndex[day] >= candidates[day].length) continue;
+            if (loads[day] - loads[0] <= SMOOTHING_TOLERANCE) continue;
+            if (!bestDay || loads[day] > loads[bestDay]) bestDay = day;
+          }
+          if (!bestDay) break;
+          pulledIds.add(String(candidates[bestDay][nextIndex[bestDay]++].id));
+          loads[0]++;
+          loads[bestDay]--;
+        }
+        return pulledIds;
+      }
+
+      function isDue(card, pulledIds) {
+        return (card.dueAt || 0) <= now() || !!(pulledIds && pulledIds.has(String(card.id)));
       }
 
       function buildQueue() {
         clearAutoNextTimer();
         const cards = getCardsForStudyMode(state.data.cards);
-        let selected = state.randomPractice ? cards.slice() : cards.filter(c => isDue(c));
+        const pulledIds = computeSmoothingPullIds();
+        let selected = state.randomPractice ? cards.slice() : cards.filter(c => isDue(c, pulledIds));
 
         if (state.randomPractice) {
           // Shuffle in random practice mode.
@@ -5598,6 +5703,13 @@
         if (!card || !state.showingBack || state.awaitingNextTap) return;
         if (state.pendingRating && state.pendingRating.cardId !== String(card.id)) return;
         let mutated = false;
+        const undo = state.pendingRating ? null : {
+          cardId: String(card.id),
+          stage: card.stage,
+          dueAt: card.dueAt,
+          mutated: false,
+          promptFront: state.promptFront
+        };
         if (!state.pendingRating && !state.randomPractice) {
           if (kind === "hard") {
             card.stage = 0;
@@ -5611,11 +5723,13 @@
           mutated = true;
         }
         if (!state.pendingRating) {
+          undo.mutated = mutated;
           state.pendingRating = {
             cardId: String(card.id),
             kind,
             needsPersistence: mutated,
-            message: `${state.randomPractice ? "Stufe bleibt" : "Neue Stufe"}: ${(card.stage || 0) + 1}`
+            message: `${state.randomPractice ? "Stufe bleibt" : "Neue Stufe"}: ${(card.stage || 0) + 1}`,
+            undo
           };
         }
         const rating = state.pendingRating;
@@ -5636,6 +5750,7 @@
         }
         state.ratingSaveInProgress = false;
         state.pendingRating = null;
+        state.undoRating = rating.undo;
         state.pendingCompletedCardId = rating.cardId;
         state.lastRatingMessage = rating.message;
         if (state.view !== "study" || String(currentCard() && currentCard().id || "") !== rating.cardId) {
@@ -5690,6 +5805,69 @@
         if (button) button.disabled = !getLastCompletedCard();
       }
 
+      function getUndoRatingCard() {
+        const id = String(state.undoRating && state.undoRating.cardId || "");
+        if (!id) return null;
+        return state.data.cards.find((entry) => String(entry && entry.id || "") === id) || null;
+      }
+
+      function updateUndoRatingButton() {
+        const button = el("btnUndoRating");
+        if (!button) return;
+        button.disabled = state.view !== "study"
+          || !state.localRestoreComplete
+          || !!state.pendingRating
+          || state.ratingSaveInProgress
+          || !getUndoRatingCard();
+      }
+
+      async function undoLastRating() {
+        if (state.view !== "study" || !state.localRestoreComplete || state.pendingRating || state.ratingSaveInProgress) return;
+        const undo = state.undoRating;
+        const card = getUndoRatingCard();
+        if (!undo || !card) return;
+        clearAutoNextTimer();
+        if (undo.mutated) {
+          card.stage = undo.stage;
+          card.dueAt = undo.dueAt;
+          markCardUpdated(card);
+        }
+        state.undoRating = null;
+        const cardId = String(card.id);
+        if (String(state.pendingCompletedCardId || "") === cardId) state.pendingCompletedCardId = null;
+        if (String(state.lastCompletedCardId || "") === cardId) state.lastCompletedCardId = null;
+
+        const existingIndex = state.queue.findIndex((entry) => String(entry && entry.id || "") === cardId);
+        let position = Math.max(0, Math.min(state.idx, state.queue.length));
+        if (existingIndex >= 0 && existingIndex < position) position--;
+        const queue = state.queue.filter((entry) => String(entry && entry.id || "") !== cardId);
+        queue.splice(Math.min(position, queue.length), 0, card);
+        state.queue = queue;
+        state.idx = queue.indexOf(card);
+
+        state.promptFront = undo.promptFront;
+        state.showingBack = true;
+        state.awaitingNextTap = false;
+        state.stageSplashActive = false;
+        state.lastRatingMessage = "";
+        updateLastCompletedCardButton();
+        renderStudy();
+        animateNextCardIn();
+
+        if (!undo.mutated) return;
+        state.ratingSaveInProgress = true;
+        renderStudy();
+        try {
+          await bumpLocalRevision();
+        } catch (error) {
+          showNotice(`Rücknahme noch nicht gespeichert: ${error.message}`);
+        } finally {
+          state.ratingSaveInProgress = false;
+          renderStudy();
+        }
+        if (hasPendingSyncWork()) scheduleSyncWrite();
+      }
+
       function completePendingCardAfterAdvance() {
         const id = String(state.pendingCompletedCardId || "");
         if (!id) return;
@@ -5708,8 +5886,32 @@
         el("editFront").value = sourceCard.front;
         el("editBack").value = sourceCard.back;
         setFlairChoiceValue(el("editFlairChoice"), sourceCard.flair);
+        renderEditStageOptions(normalizeCardStage(card.stage));
         applyEditInputSpellcheck();
         showAppDialog(el("editDialog"));
+      }
+
+      function normalizeCardStage(value) {
+        const stage = Math.round(Number(value) || 0);
+        return Math.max(0, Math.min(STAGES.length - 1, stage));
+      }
+
+      function formatStageInterval(days) {
+        if (days === 0) return "sofort";
+        if (days === 1) return "1 Tag";
+        return `${days} Tage`;
+      }
+
+      function renderEditStageOptions(currentStage) {
+        const select = el("editStage");
+        select.replaceChildren(...STAGES.map((days, index) => {
+          const option = document.createElement("option");
+          option.value = String(index);
+          const suffix = index === currentStage ? " (aktuell)" : "";
+          option.textContent = `Stufe ${index + 1} · ${formatStageInterval(days)}${suffix}`;
+          return option;
+        }));
+        select.value = String(currentStage);
       }
 
       function openEditDialogForAllCardsDraft(draftCard) {
@@ -5750,6 +5952,8 @@
         draftCard.front = card.front;
         draftCard.back = card.back;
         draftCard.flair = card.flair;
+        draftCard.stage = card.stage;
+        draftCard.dueAt = card.dueAt;
         draftCard.updatedAt = card.updatedAt;
         return true;
       }
@@ -6056,6 +6260,7 @@
         const nextFront = el("editFront").value.trim();
         const nextBack = el("editBack").value.trim();
         const nextFlair = normalizeCardFlair(getFlairChoiceValue(el("editFlairChoice")), "");
+        const nextStage = normalizeCardStage(el("editStage").value);
         if (!nextFront || !nextBack || !nextFlair) {
           alert("Bitte Vorderseite, Rückseite und Flair ausfüllen.");
           return;
@@ -6076,6 +6281,12 @@
         card.front = nextFront;
         card.back = nextBack;
         card.flair = nextFlair;
+        const stageChanged = nextStage !== normalizeCardStage(card.stage);
+        if (stageChanged) {
+          card.stage = nextStage;
+          card.dueAt = now() + (STAGES[nextStage] * dayMs);
+          if (state.undoRating && state.undoRating.cardId === String(card.id)) state.undoRating = null;
+        }
         markCardUpdated(card);
         const renderAllCards = syncCardToAllCardsDraft(card);
         try {
@@ -6085,7 +6296,11 @@
           return;
         }
         closeEditDialog();
-        renderStudy();
+        if (stageChanged && !state.randomPractice) {
+          buildQueue();
+        } else {
+          renderStudy();
+        }
         if (state.view === "list") renderList();
         if (renderAllCards && el("allCardsDialog").open) renderAllCardsDialog();
       }
@@ -6111,18 +6326,25 @@
       }
 
       function formatDueCount() {
-        return getCardsForStudyMode(state.data.cards).filter(isDue).length;
+        const pulledIds = computeSmoothingPullIds();
+        return getCardsForStudyMode(state.data.cards).filter(card => isDue(card, pulledIds)).length;
       }
 
       function getDueCount() {
-        return state.data.cards.filter(isDue).length;
+        const pulledIds = computeSmoothingPullIds();
+        return state.data.cards.filter(card => isDue(card, pulledIds)).length;
       }
 
       function serializeCardsForBadgeSync() {
-        return state.data.cards.map((card) => ({
-          id: String(card.id || ""),
-          dueAt: Number(card.dueAt) || 0
-        }));
+        const pulledIds = computeSmoothingPullIds();
+        const timestamp = now();
+        return state.data.cards.map((card) => {
+          const dueAt = Number(card.dueAt) || 0;
+          return {
+            id: String(card.id || ""),
+            dueAt: pulledIds.has(String(card.id)) ? Math.min(dueAt, timestamp) : dueAt
+          };
+        });
       }
 
       async function postBadgeStateToServiceWorker(dueCount) {
@@ -6181,9 +6403,10 @@
 
       function getNextDueTimestamp() {
         let nextDueAt = 0;
+        const pulledIds = computeSmoothingPullIds();
         for (const card of state.data.cards) {
           const dueAt = Number(card && card.dueAt) || 0;
-          if (dueAt <= Date.now()) continue;
+          if (dueAt <= Date.now() || pulledIds.has(String(card && card.id))) continue;
           if (!nextDueAt || dueAt < nextDueAt) nextDueAt = dueAt;
         }
         return nextDueAt;
@@ -6402,6 +6625,7 @@
         } else if (view === "settings") {
           renderSettings();
         }
+        updateUndoRatingButton();
       }
 
       function renderStudy() {
@@ -6410,6 +6634,7 @@
         const studyCardsCount = getCardsForStudyMode(state.data.cards).length;
         const ratingEnabled = state.localRestoreComplete && !!card && state.showingBack && !state.awaitingNextTap && !state.ratingSaveInProgress;
         const speakBtn = el("btnSpeak");
+        updateUndoRatingButton();
         updateDuePill();
         renderFlashFlairToggles(card ? card.flair : null);
         el("btnHard").disabled = !ratingEnabled || !!(state.pendingRating && state.pendingRating.kind !== "hard");
@@ -6842,6 +7067,7 @@
 
       el("btnHard").addEventListener("click", () => rate("hard"));
       el("btnOk").addEventListener("click", () => rate("ok"));
+      el("btnUndoRating").addEventListener("click", undoLastRating);
       el("btnEdit").addEventListener("click", editCurrentCard);
       el("btnEditSave").addEventListener("click", saveEditDialog);
       el("btnEditDelete").addEventListener("click", deleteFromEditDialog);
