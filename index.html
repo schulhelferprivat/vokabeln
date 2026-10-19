@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="de">
+<html lang="de" class="view-study">
 
 <head>
   <meta charset="utf-8" />
@@ -273,6 +273,8 @@
       padding: var(--space-3) var(--space-4);
       border-radius: var(--radius-lg);
       background-clip: padding-box;
+      backdrop-filter: none;
+      -webkit-backdrop-filter: none;
       transition: box-shadow var(--duration-normal) ease, border-color var(--duration-normal) ease, transform var(--duration-normal) ease;
     }
 
@@ -532,7 +534,7 @@
       outline: none;
       border: var(--stroke-width) solid var(--stroke-strong);
       perspective: 1200px;
-      box-shadow: var(--shadow-lg), inset 0 1px 0 rgba(255, 255, 255, .24);
+      box-shadow: var(--shadow-lg);
       overflow: hidden;
     }
 
@@ -555,8 +557,7 @@
       background:
         radial-gradient(calc(var(--glass-pointer-size) * 1.05) calc(var(--glass-pointer-size) * 1.05) at var(--glass-pointer-x) var(--glass-pointer-y),
           rgba(255, 255, 255, calc(var(--glass-pointer-strength) * 1.1)),
-          rgba(255, 255, 255, 0) 66%),
-        radial-gradient(100% 120% at 50% 0, rgba(255, 255, 255, .2), rgba(255, 255, 255, 0) 56%);
+          rgba(255, 255, 255, 0) 66%);
       opacity: .52;
       animation: glassSheenPulse calc(var(--glass-flow-duration) * .66) ease-in-out infinite;
       z-index: 1;
@@ -1947,10 +1948,16 @@
         flex-direction: column;
         height: 100vh;
         height: 100dvh;
+        height: var(--app-height, 100dvh);
         min-height: 0;
         padding-left: calc(12px + var(--safe-left));
         padding-right: calc(12px + var(--safe-right));
         padding-bottom: max(var(--space-2), var(--safe-bottom));
+      }
+
+      html.view-study,
+      html.view-study body {
+        overflow: hidden;
       }
 
       .app {
@@ -6682,6 +6689,7 @@
         el("tabList").setAttribute("aria-selected", view === "list" ? "true" : "false");
         el("tabSettings").setAttribute("aria-selected", view === "settings" ? "true" : "false");
 
+        document.documentElement.classList.toggle("view-study", view === "study");
         el("viewStudy").classList.toggle("hide", view !== "study");
         el("viewList").classList.toggle("hide", view !== "list");
         el("viewSettings").classList.toggle("hide", view !== "settings");
@@ -7114,6 +7122,38 @@
           updateTabIndicator();
         });
       };
+      let safeTopProbe = null;
+      let appHeightRaf = 0;
+      const syncAppHeight = () => {
+        appHeightRaf = 0;
+        if (!safeTopProbe) {
+          safeTopProbe = document.createElement("div");
+          safeTopProbe.setAttribute("aria-hidden", "true");
+          safeTopProbe.style.cssText = "position:fixed;top:0;left:0;width:0;height:env(safe-area-inset-top, 0px);visibility:hidden;pointer-events:none;";
+          document.body.appendChild(safeTopProbe);
+        }
+        const safeTop = safeTopProbe.getBoundingClientRect().height || 0;
+        const viewportHeight = window.innerHeight;
+        const standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+        const portrait = window.matchMedia("(orientation: portrait)").matches;
+        const screenHeight = portrait
+          ? Math.max(window.screen.width, window.screen.height)
+          : Math.min(window.screen.width, window.screen.height);
+        let appHeight = viewportHeight;
+        if (standalone && safeTop > 0 && viewportHeight + safeTop <= screenHeight + 1) {
+          appHeight = viewportHeight + safeTop;
+        }
+        document.documentElement.style.setProperty("--app-height", `${Math.round(appHeight)}px`);
+      };
+      const queueAppHeightSync = () => {
+        if (appHeightRaf) cancelAnimationFrame(appHeightRaf);
+        appHeightRaf = requestAnimationFrame(syncAppHeight);
+      };
+      syncAppHeight();
+      window.addEventListener("resize", queueAppHeightSync);
+      window.addEventListener("orientationchange", queueAppHeightSync);
+      window.addEventListener("pageshow", queueAppHeightSync);
+      if (window.visualViewport) window.visualViewport.addEventListener("resize", queueAppHeightSync);
       window.addEventListener("resize", queueTabIndicatorUpdate);
       window.addEventListener("orientationchange", queueTabIndicatorUpdate);
       window.addEventListener("resize", queueFlashWordFit);
