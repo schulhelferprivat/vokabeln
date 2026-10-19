@@ -225,7 +225,6 @@
       background: linear-gradient(168deg, var(--surface-elevated), var(--surface));
     }
 
-    header::before,
     .card::before,
     .notifCard::before,
     dialog::before {
@@ -240,7 +239,6 @@
       z-index: 0;
     }
 
-    header::after,
     .card::after,
     .notifCard::after,
     dialog::after {
@@ -259,11 +257,6 @@
       z-index: 1;
     }
 
-    header::after {
-      background: linear-gradient(120deg, rgba(255, 255, 255, .18), rgba(255, 255, 255, 0) 32%, rgba(255, 255, 255, .08) 70%, rgba(255, 255, 255, 0));
-      opacity: .34;
-    }
-
     header>*,
     .card>*,
     dialog>*,
@@ -279,13 +272,16 @@
       gap: var(--space-3);
       padding: var(--space-3) var(--space-4);
       border-radius: var(--radius-lg);
+      background-clip: padding-box;
       transition: box-shadow var(--duration-normal) ease, border-color var(--duration-normal) ease, transform var(--duration-normal) ease;
     }
 
-    header:hover {
-      border-color: var(--stroke-strong);
-      box-shadow: var(--shadow-lg);
-      transform: translateY(-1px);
+    @media (hover: hover) and (pointer: fine) {
+      header:hover {
+        border-color: var(--stroke-strong);
+        box-shadow: var(--shadow-lg);
+        transform: translateY(-1px);
+      }
     }
 
     header .title {
@@ -1949,7 +1945,9 @@
       body {
         display: flex;
         flex-direction: column;
-        min-height: 100dvh;
+        height: 100vh;
+        height: 100dvh;
+        min-height: 0;
         padding-left: calc(12px + var(--safe-left));
         padding-right: calc(12px + var(--safe-right));
         padding-bottom: max(var(--space-2), var(--safe-bottom));
@@ -1963,10 +1961,13 @@
 
       main {
         gap: var(--space-3);
+        min-height: 0;
       }
 
-      main {
-        min-height: 0;
+      header,
+      .studyActions,
+      main > .card {
+        flex-shrink: 0;
       }
 
       .studyWrap {
