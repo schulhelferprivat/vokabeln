@@ -310,12 +310,13 @@
 
     header .sub {
       margin: 0;
-      font-size: 12px;
-      color: var(--text-secondary);
+      font-size: 15px;
+      font-weight: 650;
+      color: var(--text-primary);
       line-height: 1.35;
-      white-space: normal;
-      overflow: visible;
-      text-overflow: clip;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .headerActions {
@@ -325,7 +326,7 @@
       flex: 0 0 auto;
     }
 
-    .btn.headerSearchBtn {
+    .btn.headerIconBtn {
       width: 44px;
       min-width: 44px;
       height: 44px;
@@ -336,6 +337,19 @@
       border-radius: var(--radius-sm);
       font-size: 19px;
       line-height: 1;
+    }
+
+    .headerIconBtn .headerGlyph {
+      width: 20px;
+      height: 20px;
+      display: block;
+      position: relative;
+      z-index: 1;
+      stroke: currentColor;
+      fill: none;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
     }
 
     .seg {
@@ -440,10 +454,6 @@
 
     .seg button:active {
       transform: scale(.96);
-    }
-
-    .headerBackSeg {
-      flex: 0 0 auto;
     }
 
     .seg button:disabled {
@@ -937,7 +947,18 @@
       padding: 6px 8px;
       word-break: break-word;
       text-wrap: balance;
+      white-space: pre-line;
       color: var(--text-primary);
+    }
+
+    .flashWord code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: .88em;
+      font-weight: 700;
+      padding: 0 .25em;
+      border-radius: 6px;
+      background: color-mix(in srgb, var(--surface-elevated) 80%, transparent);
+      border: var(--stroke-width) solid var(--stroke);
     }
 
     .flashHint {
@@ -1387,6 +1408,10 @@
       white-space: pre-line;
     }
 
+    .formatHint {
+      margin-top: 6px;
+    }
+
     #viewSettings {
       display: flex;
       flex-direction: column;
@@ -1785,8 +1810,15 @@
       user-select: none;
     }
 
-    .allCardsItem input {
+    .allCardsItem input,
+    .allCardsItem textarea {
       min-height: 44px;
+    }
+
+    .allCardsItem textarea {
+      resize: vertical;
+      overflow: hidden;
+      line-height: 1.35;
     }
 
     .allCardsFlairChoice {
@@ -1915,13 +1947,22 @@
 
     @media (max-width: 640px) {
       body {
+        display: flex;
+        flex-direction: column;
         min-height: 100dvh;
         padding-left: calc(12px + var(--safe-left));
         padding-right: calc(12px + var(--safe-right));
+        padding-bottom: max(var(--space-2), var(--safe-bottom));
       }
 
       .app {
-        min-height: calc(100dvh - var(--safe-top) - var(--safe-bottom));
+        flex: 1;
+        min-height: 0;
+        gap: var(--space-3);
+      }
+
+      main {
+        gap: var(--space-3);
       }
 
       main {
@@ -1959,12 +2000,8 @@
         padding: 10px;
       }
 
-      header h1 {
-        font-size: 16px;
-      }
-
       header .sub {
-        font-size: 11px;
+        font-size: 14px;
       }
 
       .seg {
@@ -2122,21 +2159,18 @@
 <body>
   <div class="app">
     <header>
-      <div class="seg headerBackSeg">
-        <button type="button" id="btnUndoRating" class="tabIcon" aria-label="Letzte Bewertung rückgängig"
-          title="Zurück zur letzten Karte" disabled>
-          <svg class="tabGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M9 14L4 9l5-5"></path>
-            <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"></path>
-          </svg>
-        </button>
-      </div>
+      <button type="button" id="btnUndoRating" class="btn icon headerIconBtn" aria-label="Letzte Bewertung rückgängig"
+        title="Zurück zur letzten Karte" disabled>
+        <svg class="headerGlyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M9 14L4 9l5-5"></path>
+          <path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"></path>
+        </svg>
+      </button>
       <div class="title">
-        <h1 id="appTitle">Vokabeltrainer</h1>
-        <p class="sub" id="duePill">Fällige Vokabeln: 0</p>
+        <p class="sub" id="duePill">Fällig: 0</p>
       </div>
       <div class="headerActions">
-        <button type="button" class="btn icon headerSearchBtn" id="btnOpenAllCardsSearch" aria-label="Vokabeln suchen"
+        <button type="button" class="btn icon headerIconBtn" id="btnOpenAllCardsSearch" aria-label="Vokabeln suchen"
           title="Vokabeln suchen">🔎</button>
         <div class="seg" role="tablist" aria-label="Ansicht">
           <span class="segIndicator" id="tabIndicator" aria-hidden="true"></span>
@@ -2156,7 +2190,7 @@
 
     <main>
       <!-- STUDY -->
-      <section id="viewStudy" class="card studyWrap" aria-labelledby="tabStudy">
+      <section id="viewStudy" class="studyWrap" aria-labelledby="tabStudy">
         <div id="flashcard" class="flashcard" tabindex="0" role="button" aria-label="Karte umdrehen">
           <div class="flashInner">
             <div class="flashFace flashFront">
@@ -2214,6 +2248,7 @@
           <div class="col">
             <textarea id="addBack" class="inputLarge addCardInput" rows="4" placeholder="z.B. to go" aria-label="Rückseite"
               autocomplete="off" spellcheck="true" lang="de-DE"></textarea>
+            <div class="note formatHint">Formatierung: **fett**, *kursiv*, ~~durchgestrichen~~, `code` · Enter = neue Zeile</div>
           </div>
         </div>
         <div class="row inputStack addInline">
@@ -2302,6 +2337,7 @@
         <textarea id="editBack" rows="4" autocomplete="off" spellcheck="true" lang="de-DE"></textarea>
       </div>
     </div>
+    <div class="note formatHint">Formatierung: **fett**, *kursiv*, ~~durchgestrichen~~, `code` · Enter = neue Zeile</div>
     <div class="dialogActions editDialogActions">
       <button class="btn danger" id="btnEditDelete" type="button">Löschen</button>
       <button class="btn" id="btnEditCancel" type="button">Abbrechen</button>
@@ -2625,8 +2661,6 @@
         }
 
         document.title = APP_NAME;
-        const appTitle = document.getElementById("appTitle");
-        if (appTitle) appTitle.textContent = APP_NAME;
         const settingsVersion = document.getElementById("settingsVersion");
         if (settingsVersion) settingsVersion.textContent = versionLabel;
       }
@@ -6076,24 +6110,26 @@
           indexBadge.textContent = String(index + 1);
           indexBadge.setAttribute("aria-hidden", "true");
 
-          const frontInput = document.createElement("input");
-          frontInput.type = "text";
+          const frontInput = document.createElement("textarea");
+          frontInput.rows = 1;
           frontInput.value = card.front;
           frontInput.placeholder = "Vorderseite";
           frontInput.setAttribute("aria-label", `Karte ${index + 1} Vorderseite`);
           frontInput.addEventListener("input", () => {
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             allCardsDraft[index].front = frontInput.value;
+            autoResizeTextarea(frontInput);
           });
 
-          const backInput = document.createElement("input");
-          backInput.type = "text";
+          const backInput = document.createElement("textarea");
+          backInput.rows = 1;
           backInput.value = card.back;
           backInput.placeholder = "Rückseite";
           backInput.setAttribute("aria-label", `Karte ${index + 1} Rückseite`);
           backInput.addEventListener("input", () => {
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             allCardsDraft[index].back = backInput.value;
+            autoResizeTextarea(backInput);
           });
 
           const flairWrap = document.createElement("div");
@@ -6160,6 +6196,8 @@
           actions.append(editBtn, deleteBtn);
           row.append(indexBadge, flairWrap, frontInput, backInput, actions);
           list.appendChild(row);
+          autoResizeTextarea(frontInput);
+          autoResizeTextarea(backInput);
         });
       }
 
@@ -6506,7 +6544,7 @@
         const pill = el("duePill");
         if (!pill) return;
         const prevDue = pill.dataset.dueCount || "";
-        pill.textContent = `Fällige Vokabeln: ${dueCount}`;
+        pill.textContent = `Fällig: ${dueCount}`;
         pill.dataset.dueCount = String(dueCount);
         if (prevDue && prevDue !== String(dueCount)) {
           pill.classList.remove("pillBump");
@@ -6526,6 +6564,39 @@
       function resetFlashWordSizes() {
         el("flashFrontWord").style.removeProperty("font-size");
         el("flashBackWord").style.removeProperty("font-size");
+      }
+
+      const CARD_TEXT_PATTERN = /(`[^`\n]+`)|\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*|~~(?!\s)([^~\n]+?)(?<!\s)~~|\*(?!\s)([^*\n]+?)(?<!\s)\*|(?<![\p{L}\p{N}_])_(?!\s)([^_\n]+?)(?<!\s)_(?![\p{L}\p{N}_])/gu;
+
+      function renderCardText(node, rawText) {
+        const text = String(rawText || "");
+        const fragment = document.createDocumentFragment();
+        let lastIndex = 0;
+        for (const match of text.matchAll(CARD_TEXT_PATTERN)) {
+          if (match.index > lastIndex) {
+            fragment.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+          }
+          let element;
+          if (match[1]) {
+            element = document.createElement("code");
+            element.textContent = match[1].slice(1, -1);
+          } else if (match[2]) {
+            element = document.createElement("strong");
+            element.textContent = match[2];
+          } else if (match[3]) {
+            element = document.createElement("s");
+            element.textContent = match[3];
+          } else {
+            element = document.createElement("em");
+            element.textContent = match[4] || match[5];
+          }
+          fragment.appendChild(element);
+          lastIndex = match.index + match[0].length;
+        }
+        if (lastIndex < text.length) {
+          fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+        }
+        node.replaceChildren(fragment);
       }
 
       function getPixelValue(styles, property) {
@@ -6674,9 +6745,9 @@
         const promptWord = state.promptFront ? card.front : card.back;
         const answerWord = state.promptFront ? card.back : card.front;
         const visibleWord = state.showingBack ? answerWord : promptWord;
-        el("flashFrontWord").textContent = promptWord;
+        renderCardText(el("flashFrontWord"), promptWord);
         el("flashFrontHint").textContent = "Tippe, um die Rückseite zu zeigen.";
-        el("flashBackWord").textContent = answerWord;
+        renderCardText(el("flashBackWord"), answerWord);
         if (speakBtn) {
           const visibleIsBack = visibleWord === card.back;
           const canSpeak = isUsFlair(card.flair)
