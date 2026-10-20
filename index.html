@@ -61,6 +61,7 @@
     :root[data-theme="dark"] {
       color-scheme: dark;
       --bg-base: #050912;
+      --bg-top: #0b1730;
       --bg-grad-a: linear-gradient(180deg, #0b1730 0%, #091326 22%, #050d1d 56%, #030812 100%);
       --bg-grad-b: linear-gradient(90deg, rgba(3, 9, 20, .88) 0%, rgba(3, 9, 20, 0) 18%, rgba(3, 9, 20, 0) 82%, rgba(3, 9, 20, .9) 100%);
       --bg-grad-c: none;
@@ -100,6 +101,7 @@
     :root[data-theme="light"] {
       color-scheme: light;
       --bg-base: #e8eef8;
+      --bg-top: #f4f8ff;
       --bg-grad-a: linear-gradient(180deg, #f4f8ff 0%, #edf3fc 44%, #e5edf8 100%);
       --bg-grad-b: linear-gradient(90deg, rgba(206, 219, 238, .38) 0%, rgba(206, 219, 238, 0) 18%, rgba(206, 219, 238, 0) 82%, rgba(206, 219, 238, .4) 100%);
       --bg-grad-c: none;
@@ -185,8 +187,8 @@
         left: 0;
         right: 0;
         height: env(safe-area-inset-top);
-        backdrop-filter: blur(10px);
-        mask: linear-gradient(to bottom, black, black 55%, rgba(0, 0, 0, 0) 100%);
+        pointer-events: none;
+        background: linear-gradient(to bottom, var(--bg-top), var(--bg-top) 60%, transparent);
       }
     }
 
