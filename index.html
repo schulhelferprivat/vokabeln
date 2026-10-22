@@ -2294,6 +2294,7 @@
         <div class="settingsSection">
           <div class="settingsHeading">Datenbankspeicherort</div>
           <div class="actions">
+            <button class="btn" id="btnDeviceProfile">Nur auf diesem Gerät</button>
             <button class="btn" id="btnPickSyncFolder">Lokaler Ordner</button>
             <button class="btn" id="btnOpenFirebaseDialog">Firebase</button>
           </div>
@@ -2838,6 +2839,11 @@
       const SYNC_FIREBASE_CONFIG_EXPORT_PROMPT_KEY = "syncFirebaseConfigExportPrompt";
       const SYNC_OUTBOX_KEY = "syncOutbox.v1";
       const SYNC_LOCAL_SNAPSHOT_KEY = "localSnapshot.v1";
+      const SYNC_ACTIVE_PROFILE_KEY = "activeProfile.v1";
+      const SYNC_PROFILES_KEY = "profiles.v1";
+      const SYNC_FIREBASE_DRAFT_KEY = "firebaseDraft.v1";
+      const SYNC_PROFILE_MIGRATION_NOTICE_KEY = "profileMigrationNotice.v1";
+      const DEVICE_PROFILE_ID = "device";
       let localSnapshotPersistPromise = Promise.resolve();
       const THEME_MODE_KEY = "themeMode";
       const SYNC_RETRY_BASE_MS = 1200;
@@ -2889,6 +2895,12 @@
 
       const state = {
         data: createInitialData(),
+        activeProfileId: DEVICE_PROFILE_ID,
+        profileSwitching: false,
+        profileSwitchTransaction: null,
+        profileMutations: new Set(),
+        syncPromise: Promise.resolve(),
+        firebaseDraftConfig: null,
         view: "study",
         queue: [],
         idx: 0,
@@ -2922,11 +2934,8 @@
         syncFirebaseTokenExpiresAt: 0,
         syncFirebaseEtag: null,
         firebaseConfigExportPromptedFingerprint: "",
-        firebaseDialogInitialConfig: null,
         firebaseConnectInProgress: false,
         firebaseConnectionAttempt: 0,
-        firebaseConnectionSessionAttempt: 0,
-        firebaseConnectionPreserveSessionOnClose: false,
         firebaseConfigImportInProgress: false,
         firebaseConfigImportAttempt: 0,
         firebaseSessionGeneration: 0,
@@ -4245,35 +4254,13 @@
       }
 
       async function writeLocalSnapshot(snapshot) {
-        const db = await openSyncDb();
-        try {
-          await new Promise((resolve, reject) => {
-            const tx = db.transaction(SYNC_DB_STORE, "readwrite");
-            const store = tx.objectStore(SYNC_DB_STORE);
-            store.put(snapshot, SYNC_LOCAL_SNAPSHOT_KEY);
-            if (snapshot.pendingSyncWrite || snapshot.revision !== snapshot.lastSyncedRevision) {
-              store.put(snapshot, SYNC_OUTBOX_KEY);
-            } else {
-              const request = store.get(SYNC_OUTBOX_KEY);
-              request.onsuccess = () => {
-                const outbox = request.result;
-                if (!outbox || (Number(outbox.revision) || 0) <= snapshot.lastSyncedRevision) {
-                  store.delete(SYNC_OUTBOX_KEY);
-                }
-              };
-            }
-            tx.oncomplete = resolve;
-            tx.onerror = () => reject(tx.error || new Error("Lokales Speichern fehlgeschlagen."));
-            tx.onabort = () => reject(tx.error || new Error("Lokales Speichern abgebrochen."));
-          });
-        } finally {
-          db.close();
-        }
+        await idbSet(profileSnapshotKey(snapshot.profileId), snapshot);
       }
 
       function persistLocalSnapshot() {
         const localSyncState = getLocalSyncStateSnapshot();
         const snapshot = {
+          profileId: state.activeProfileId,
           revision: Number(state.localRevision) || 0,
           lastSyncedRevision: Number(state.lastSyncedRevision) || 0,
           pendingSyncWrite: state.pendingSyncWrite,
@@ -4284,11 +4271,13 @@
         localSnapshotPersistPromise = localSnapshotPersistPromise.catch(() => {})
           .then(() => writeLocalSnapshot(snapshot))
           .then(() => {
+            if (snapshot.profileId !== state.activeProfileId) return;
             const recovered = !!state.localPersistenceError;
             state.localPersistenceError = "";
             if (recovered) setSyncStatus("Lokal gespeichert.");
           })
           .catch(error => {
+            if (snapshot.profileId !== state.activeProfileId) throw error;
             state.localPersistenceError = error.message || "Lokales Speichern fehlgeschlagen.";
             setSyncStatus(`Lokal nicht gespeichert: ${state.localPersistenceError}`);
             throw error;
@@ -4297,36 +4286,219 @@
       }
 
       async function restoreLocalSnapshot() {
-        const snapshot = await idbGet(SYNC_LOCAL_SNAPSHOT_KEY);
-        if (!snapshot) return false;
-        if (!Array.isArray(snapshot.cards)) throw new Error("Gespeicherter lokaler Lernstand ist ungültig.");
-        const restoredState = normalizeSyncState(snapshot);
-        state.data.cards = restoredState.cards;
-        state.syncDeletedCardTimestamps = restoredState.deletedCardIds;
-        state.localRevision = Math.max(0, Number(snapshot.revision) || 0);
-        state.lastSyncedRevision = Math.min(state.localRevision,
-          Math.max(0, Number(snapshot.lastSyncedRevision) || 0));
-        state.pendingSyncWrite = !!snapshot.pendingSyncWrite || state.lastSyncedRevision !== state.localRevision;
-        return true;
+        const snapshot = await idbGet(profileSnapshotKey(state.activeProfileId));
+        applyProfileSnapshot(snapshot);
+        return !!snapshot;
       }
 
-      async function restoreSyncOutboxSnapshot() {
-        const snapshot = await idbGet(SYNC_OUTBOX_KEY);
-        if (!snapshot) return false;
-        if (!Array.isArray(snapshot.cards)) throw new Error("Gespeicherte ungesendete Änderungen sind ungültig.");
-        const snapshotRevision = Math.max(0, Number(snapshot.revision) || 0);
-        if (snapshotRevision > 0 && snapshotRevision <= state.lastSyncedRevision) return false;
-        const localState = getLocalSyncStateSnapshot();
-        const restoredState = mergeSyncStates(localState, snapshot, { preferLocalOnTie: true });
-        const changed = !areSyncStatesEqual(localState, restoredState);
-        state.suppressMutationSync = true;
-        state.data.cards = restoredState.cards;
-        state.syncDeletedCardTimestamps = restoredState.deletedCardIds;
-        state.suppressMutationSync = false;
-        state.localRevision = Math.max(1, snapshotRevision, state.localRevision + (changed ? 1 : 0));
-        state.pendingSyncWrite = true;
-        setSyncStatus("Datenbank: Ungesendete lokale Änderungen wiederhergestellt, synchronisiere...");
-        return true;
+      function profileSnapshotKey(profileId) {
+        return ["profileSnapshot.v1", profileId];
+      }
+
+
+      function getFirebaseProfileId(config, userUid) {
+        const databaseUrl = normalizeFirebaseConfig(config).databaseUrl;
+        if (!databaseUrl || !userUid) throw new Error("Firebase-Benutzer konnte nicht bestätigt werden.");
+        return JSON.stringify(["firebase", databaseUrl, String(userUid)]);
+      }
+
+      function applyProfileSnapshot(snapshot) {
+        if (snapshot && (!Array.isArray(snapshot.cards) || snapshot.profileId !== state.activeProfileId)) {
+          throw new Error("Gespeicherter Lernstand gehört nicht zum ausgewählten Profil.");
+        }
+        const restored = normalizeSyncState(snapshot || {});
+        state.data.cards = restored.cards;
+        state.syncDeletedCardTimestamps = restored.deletedCardIds;
+        state.localRevision = Math.max(0, Number(snapshot && snapshot.revision) || 0);
+        state.lastSyncedRevision = Math.min(state.localRevision,
+          Math.max(0, Number(snapshot && snapshot.lastSyncedRevision) || 0));
+        state.pendingSyncWrite = !!(snapshot && snapshot.pendingSyncWrite) ||
+          state.lastSyncedRevision !== state.localRevision;
+        state.localPersistenceError = "";
+      }
+
+      async function migrateSyncProfiles() {
+        const db = await openSyncDb();
+        try {
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(SYNC_DB_STORE, "readwrite");
+            const store = tx.objectStore(SYNC_DB_STORE);
+            const request = store.get(SYNC_ACTIVE_PROFILE_KEY);
+            let failure;
+            request.onsuccess = () => {
+              if (request.result) return;
+              const snapshotRequest = store.get(SYNC_LOCAL_SNAPSHOT_KEY);
+              const outboxRequest = store.get(SYNC_OUTBOX_KEY);
+              const configRequest = store.get(SYNC_FIREBASE_CONFIG_KEY);
+              configRequest.onsuccess = () => {
+                try {
+                  const snapshot = snapshotRequest.result;
+                  const outbox = outboxRequest.result;
+                  for (const value of [snapshot, outbox]) {
+                    if (value && !Array.isArray(value.cards)) throw new Error("Bestehender Lernstand ist ungültig.");
+                  }
+                  const restored = mergeSyncStates(snapshot || {}, outbox || {});
+                  const revision = Math.max(Number(snapshot && snapshot.revision) || 0,
+                    Number(outbox && outbox.revision) || 0);
+                  store.put({ ...restored, profileId: DEVICE_PROFILE_ID, revision,
+                    lastSyncedRevision: 0, pendingSyncWrite: !!(snapshot || outbox), savedAt: now()
+                  }, profileSnapshotKey(DEVICE_PROFILE_ID));
+                  store.put({ id: DEVICE_PROFILE_ID, kind: "device" }, SYNC_ACTIVE_PROFILE_KEY);
+                  store.put([], SYNC_PROFILES_KEY);
+                  if (configRequest.result) store.put(toPersistedFirebaseConfig(configRequest.result), SYNC_FIREBASE_DRAFT_KEY);
+                  if (snapshot || outbox) {
+                    store.put({ snapshot, outbox }, "legacyProfileBackup.v1");
+                    store.put(true, SYNC_PROFILE_MIGRATION_NOTICE_KEY);
+                  }
+                  for (const key of [SYNC_LOCAL_SNAPSHOT_KEY, SYNC_OUTBOX_KEY, SYNC_MODE_KEY,
+                    SYNC_FIREBASE_SESSION_KEY, SYNC_FIREBASE_CONFIG_KEY,
+                    SYNC_LOCAL_DIRECTORY_KEY, SYNC_LOCAL_FILE_KEY]) store.delete(key);
+                } catch (error) {
+                  failure = error;
+                  tx.abort();
+                }
+              };
+            };
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(failure || tx.error || new Error("Migration fehlgeschlagen."));
+            tx.onabort = () => reject(failure || tx.error || new Error("Migration abgebrochen."));
+          });
+        } finally {
+          db.close();
+        }
+      }
+
+      async function findLocalProfile(handle, kind) {
+        const profiles = await idbGet(SYNC_PROFILES_KEY) || [];
+        for (const profile of profiles) {
+          if (profile.kind === kind && await handle.isSameEntry(profile.handle)) return profile;
+        }
+        return { id: `local:${uid()}`, kind, handle };
+      }
+
+      async function commitActiveProfile(profile, isCurrent) {
+        const db = await openSyncDb();
+        try {
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(SYNC_DB_STORE, "readwrite");
+            state.profileSwitchTransaction = tx;
+            const store = tx.objectStore(SYNC_DB_STORE);
+            const request = store.get(SYNC_PROFILES_KEY);
+            request.onsuccess = () => {
+              if (!isCurrent()) {
+                tx.abort();
+                return;
+              }
+              const profiles = request.result || [];
+              if (profile.kind === "file" || profile.kind === "directory") {
+                if (!profiles.some(entry => entry.id === profile.id)) profiles.push(profile);
+                store.put(profiles, SYNC_PROFILES_KEY);
+              }
+              const persisted = { ...profile };
+              if (profile.session) persisted.session = normalizeFirebaseSession(profile.session);
+              store.put(persisted, SYNC_ACTIVE_PROFILE_KEY);
+            };
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error || new Error("Profil konnte nicht gespeichert werden."));
+            tx.onabort = () => reject(tx.error || new Error("Profilwechsel abgebrochen."));
+          });
+        } finally {
+          state.profileSwitchTransaction = null;
+          db.close();
+        }
+      }
+
+      function applyActiveProfile(profile) {
+        if (profile.kind === "firebase" &&
+          profile.id !== getFirebaseProfileId(profile.config, profile.session && profile.session.userUid)) {
+          throw new Error("Firebase-Sitzung gehört nicht zum gespeicherten Profil.");
+        }
+        state.activeProfileId = profile.id;
+        clearFirebaseSession();
+        state.syncMode = profile.kind === "firebase" ? "firebase" :
+          profile.kind === "file" || profile.kind === "directory" ? "local" : null;
+        state.syncLocalDirectoryHandle = profile.kind === "directory" ? profile.handle : null;
+        state.syncLocalFileHandle = profile.kind === "file" ? profile.handle : null;
+        if (profile.kind === "firebase") {
+          state.syncFirebaseConfig = toPersistedFirebaseConfig(profile.config);
+          applyFirebaseAuthenticatedSession(profile.session);
+        }
+      }
+
+      function resetProfileView() {
+        clearAutoNextTimer();
+        clearTimeout(cardFlipAnimTimer);
+        clearTimeout(nextCardAnimTimer);
+        for (const id of ["editDialog", "allCardsDialog", "bulkAddDialog"]) {
+          const dialog = el(id);
+          if (dialog && dialog.open) dialog.close();
+        }
+        allCardsDraft = null;
+        allCardsOriginalIds = new Set();
+        allCardsSearchQuery = "";
+        editingAllCardsDraftId = "";
+        for (const id of ["addFront", "addBack", "bulkInput"]) el(id).value = "";
+        Object.assign(state, { queue: [], idx: 0, showingBack: false, awaitingNextTap: false,
+          pendingRating: null, ratingSaveInProgress: false, lastRatingMessage: "",
+          stageSplashActive: false, editingCardId: null, pendingCompletedCardId: null,
+          lastCompletedCardId: null, undoRating: null, randomPractice: false });
+        if (window.speechSynthesis) window.speechSynthesis.cancel();
+        requestRenderAfterDataChange();
+        updateLastCompletedCardButton();
+        updateAppBadge();
+      }
+
+      async function switchSyncProfile(resolveProfile, options = {}) {
+        const { isCurrent = () => true } = options;
+        if (!state.localRestoreComplete || state.profileSwitching) return false;
+        state.profileSwitching = true;
+        clearSyncRetryTimer();
+        clearTimeout(state.syncWriteTimer);
+        state.syncWriteTimer = null;
+        setLocalDataControlsEnabled(false);
+        try {
+          await Promise.allSettled([...state.profileMutations, state.syncPromise]);
+          await persistLocalSnapshot();
+          await (state.firebaseSessionPersistPromise || Promise.resolve());
+          if (!isCurrent()) return false;
+          const profile = await resolveProfile();
+          if (!isCurrent()) return false;
+          const snapshot = await idbGet(profileSnapshotKey(profile.id));
+          if (snapshot && (!Array.isArray(snapshot.cards) || snapshot.profileId !== profile.id)) {
+            throw new Error("Gespeicherter Lernstand gehört nicht zum ausgewählten Profil.");
+          }
+          await commitActiveProfile(profile, isCurrent);
+          applyActiveProfile(profile);
+          applyProfileSnapshot(snapshot);
+          state.syncRetryAttempt = 0;
+          resetProfileView();
+          setSyncModeUi(state.syncMode);
+          setSyncStatus(state.syncMode ? "Datenbank: Profil verbunden." : "Daten bleiben auf diesem Gerät.");
+          return true;
+        } finally {
+          state.profileSwitching = false;
+          setLocalDataControlsEnabled(true);
+          renderStudy();
+          if (hasPendingSyncWork()) scheduleSyncWrite();
+        }
+      }
+
+      function trackProfileMutation(operation) {
+        return function (...args) {
+          if (state.profileSwitching || !state.localRestoreComplete) return Promise.resolve(null);
+          const pending = Promise.resolve().then(() => operation(...args));
+          state.profileMutations.add(pending);
+          pending.finally(() => state.profileMutations.delete(pending)).catch(() => {});
+          return pending;
+        };
+      }
+
+      async function activateDeviceProfile() {
+        try {
+          await switchSyncProfile(() => ({ id: DEVICE_PROFILE_ID, kind: "device" }));
+        } catch (error) {
+          showNotice(`Profilwechsel fehlgeschlagen: ${error.message}`);
+        }
       }
 
       function clearSyncRetryTimer() {
@@ -4345,7 +4517,7 @@
       }
 
       function scheduleSyncRetry() {
-        if (!isAnySyncActive() || !hasPendingSyncWork()) return;
+        if (state.profileSwitching || !isAnySyncActive() || !hasPendingSyncWork()) return;
         clearSyncRetryTimer();
         const delay = getSyncRetryDelay(state.syncRetryAttempt);
         state.syncRetryAttempt += 1;
@@ -4646,8 +4818,6 @@
             clearTimeout(state.firebaseConfigPersistTimer);
             state.firebaseConfigPersistTimer = null;
           }
-          await clearFirebaseSessionForConfigChange();
-          if (!isFirebaseConfigImportCurrent(attempt)) return;
           await queueFirebaseConfigPersist(nextConfig);
           if (!isFirebaseConfigImportCurrent(attempt)) return;
           applyFirebaseConfigToUi({
@@ -4716,18 +4886,32 @@
 
       function queueFirebaseSessionPersist(session, expectedGeneration) {
         const normalized = normalizeFirebaseSession(session);
+        const profileId = state.activeProfileId;
         const previous = state.firebaseSessionPersistPromise || Promise.resolve();
-        const pending = previous
-          .catch(() => { })
-          .then(async () => {
-            if (!isFirebaseSessionCurrent(expectedGeneration)) return false;
-            if (!normalized.refreshToken) {
-              await idbDelete(SYNC_FIREBASE_SESSION_KEY);
-              return true;
-            }
-            await idbSet(SYNC_FIREBASE_SESSION_KEY, normalized);
-            return true;
-          });
+        const pending = previous.catch(() => {}).then(async () => {
+          if (!isFirebaseSessionCurrent(expectedGeneration) || profileId !== state.activeProfileId) return false;
+          const db = await openSyncDb();
+          try {
+            return await new Promise((resolve, reject) => {
+              const tx = db.transaction(SYNC_DB_STORE, "readwrite");
+              const store = tx.objectStore(SYNC_DB_STORE);
+              const request = store.get(SYNC_ACTIVE_PROFILE_KEY);
+              let saved = false;
+              request.onsuccess = () => {
+                const profile = request.result;
+                if (!isFirebaseSessionCurrent(expectedGeneration) || !profile || profile.id !== profileId) return;
+                profile.session = { ...normalized, userUid: normalized.userUid || profile.session.userUid };
+                store.put(profile, SYNC_ACTIVE_PROFILE_KEY);
+                saved = true;
+              };
+              tx.oncomplete = () => resolve(saved);
+              tx.onerror = () => reject(tx.error);
+              tx.onabort = () => reject(tx.error || new Error("Sitzung konnte nicht gespeichert werden."));
+            });
+          } finally {
+            db.close();
+          }
+        });
         state.firebaseSessionPersistPromise = pending;
         return pending;
       }
@@ -4752,11 +4936,6 @@
         } catch (e) {
           // ignore
         }
-      }
-
-      async function clearFirebaseSessionForConfigChange() {
-        const generation = clearFirebaseSession();
-        await queueFirebaseSessionPersist({}, generation);
       }
 
       function clearFirebaseSession() {
@@ -4820,6 +4999,7 @@
           "Firebase-Anmeldung fehlgeschlagen"
         );
         const uid = String(data.localId || "");
+        if (!uid) throw new Error("Firebase-Benutzer konnte nicht bestätigt werden.");
         if (normalized.allowedUid && uid !== normalized.allowedUid) {
           throw new Error("Die angemeldete UID ist nicht erlaubt.");
         }
@@ -4870,6 +5050,9 @@
           throw new Error("Firebase-Anmeldung wurde abgebrochen.");
         }
         const uid = String(data.user_id || "");
+        if (getFirebaseProfileId(normalized, uid) !== state.activeProfileId) {
+          throw new Error("Erneuerte Firebase-Sitzung gehört zu einem anderen Profil.");
+        }
         if (normalized.allowedUid && uid !== normalized.allowedUid) {
           if (isConnectionAttemptCurrent() && isFirebaseSessionCurrent(sessionGeneration, refreshToken)) {
             await clearFirebaseSessionAndPersist();
@@ -4896,6 +5079,9 @@
       async function ensureFirebaseIdToken(config, options = {}) {
         const { connectionAttempt = null } = options;
         const normalized = normalizeFirebaseConfig(config);
+        if (getFirebaseProfileId(normalized, state.syncFirebaseUserUid) !== state.activeProfileId) {
+          throw new Error("Firebase-Sitzung gehört nicht zum aktiven Profil.");
+        }
         if (connectionAttempt !== null && !isFirebaseConnectionAttemptCurrent(connectionAttempt)) {
           throw new Error("Firebase-Anmeldung wurde abgebrochen.");
         }
@@ -4917,6 +5103,7 @@
         const firebaseBtn = el("btnOpenFirebaseDialog");
         if (localBtn) localBtn.classList.toggle("primary", selectedMode === "local");
         if (firebaseBtn) firebaseBtn.classList.toggle("primary", selectedMode === "firebase");
+        el("btnDeviceProfile").classList.toggle("primary", !selectedMode);
       }
 
       async function getLocalSyncFileHandle(options = {}) {
@@ -5108,7 +5295,14 @@
         return false;
       }
 
-      async function runAutoSync(options = {}) {
+      function runAutoSync(options = {}) {
+        if (state.profileSwitching || state.syncInProgress) return state.syncPromise;
+        const pending = performAutoSync(options);
+        state.syncPromise = pending;
+        return pending;
+      }
+
+      async function performAutoSync(options = {}) {
         const { silent = false } = options;
         if (!state.localRestoreComplete || state.pendingRating || !isAnySyncActive() || state.syncInProgress) return;
         state.syncInProgress = true;
@@ -5150,7 +5344,7 @@
       }
 
       function scheduleSyncWrite() {
-        if (!state.localRestoreComplete || !isAnySyncActive()) return;
+        if (state.profileSwitching || !state.localRestoreComplete || !isAnySyncActive()) return;
         clearSyncRetryTimer();
         state.pendingSyncWrite = true;
         if (state.syncWriteTimer) clearTimeout(state.syncWriteTimer);
@@ -5160,54 +5354,45 @@
       }
 
       async function activateLocalFolder(handle) {
-        state.syncMode = "local";
-        state.syncLocalDirectoryHandle = handle;
-        state.syncLocalFileHandle = null;
-        state.syncFirebaseEtag = null;
-        setSyncModeUi("local");
-        await idbSet(SYNC_MODE_KEY, "local");
-        await idbSet(SYNC_LOCAL_DIRECTORY_KEY, handle);
-        await idbDelete(SYNC_LOCAL_FILE_KEY);
-        setSyncStatus("Datenbank (Lokal): Ordner verbunden, synchronisiere...");
-        await runAutoSync({ silent: true });
+        if (await switchSyncProfile(() => findLocalProfile(handle, "directory"))) {
+          await runAutoSync({ silent: true });
+        }
       }
 
       async function activateLocalFile(handle) {
-        state.syncMode = "local";
-        state.syncLocalDirectoryHandle = null;
-        state.syncLocalFileHandle = handle;
-        state.syncFirebaseEtag = null;
-        setSyncModeUi("local");
-        await idbSet(SYNC_MODE_KEY, "local");
-        await idbSet(SYNC_LOCAL_FILE_KEY, handle);
-        await idbDelete(SYNC_LOCAL_DIRECTORY_KEY);
-        setSyncStatus("Datenbank (Lokal): Datei verbunden, synchronisiere...");
-        await runAutoSync({ silent: true });
+        if (await switchSyncProfile(() => findLocalProfile(handle, "file"))) {
+          await runAutoSync({ silent: true });
+        }
       }
 
       async function activateFirebase(config, options = {}) {
-        const { isCurrent = () => true } = options;
-        if (!isCurrent()) return false;
-        const normalized = normalizeFirebaseConfig(config);
+        const { isCurrent = () => true, session = null } = options;
+        const normalized = toPersistedFirebaseConfig(config);
         const validationError = validateFirebaseConfig(normalized);
-        if (validationError) {
-          showNotice(validationError);
-          return false;
+        if (validationError) throw new Error(validationError);
+        const connected = await switchSyncProfile(async () => {
+          let authenticated = session;
+          if (!authenticated) {
+            if (state.syncMode !== "firebase" ||
+              normalized.databaseUrl !== state.syncFirebaseConfig.databaseUrl ||
+              normalized.apiKey !== state.syncFirebaseConfig.apiKey ||
+              normalized.email !== state.syncFirebaseConfig.email) {
+              throw new Error("Bitte Passwort eingeben.");
+            }
+            await ensureFirebaseIdToken(normalized);
+            authenticated = {
+              userUid: state.syncFirebaseUserUid, refreshToken: state.syncFirebaseRefreshToken,
+              idToken: state.syncFirebaseIdToken, tokenExpiresAt: state.syncFirebaseTokenExpiresAt
+            };
+          }
+          return { id: getFirebaseProfileId(normalized, authenticated.userUid), kind: "firebase",
+            config: normalized, session: authenticated };
+        }, { isCurrent });
+        if (connected) {
+          applyFirebaseConfigToUi(normalized);
+          await runAutoSync({ silent: true });
         }
-        const persistedConfig = toPersistedFirebaseConfig(normalized);
-        await queueFirebaseConfigPersist(persistedConfig);
-        if (!isCurrent()) return false;
-        await idbSet(SYNC_MODE_KEY, "firebase");
-        if (!isCurrent()) return false;
-        state.syncMode = "firebase";
-        state.syncFirebaseConfig = persistedConfig;
-        state.syncFirebaseEtag = null;
-        applyFirebaseConfigToUi(state.syncFirebaseConfig, { includePassword: false });
-        setSyncModeUi("firebase");
-        setSyncStatus("Datenbank (Firebase): Verbindung gespeichert, synchronisiere...");
-        if (!isCurrent()) return false;
-        await runAutoSync({ silent: true });
-        return isCurrent();
+        return connected;
       }
 
       async function chooseSyncFolder() {
@@ -5262,8 +5447,7 @@
       }
 
       function openFirebaseDialog() {
-        const config = normalizeFirebaseConfig(state.syncFirebaseConfig);
-        state.firebaseDialogInitialConfig = config;
+        const config = normalizeFirebaseConfig(state.firebaseDraftConfig || state.syncFirebaseConfig);
         applyFirebaseConfigToUi(config, { includePassword: false });
         lockFirebaseSensitiveFields();
         const opened = showAppDialog(el("firebaseDialog"));
@@ -5299,29 +5483,12 @@
         const pending = previous
           .catch(() => { })
           .then(async () => {
-            await idbSet(SYNC_FIREBASE_CONFIG_KEY, normalized);
-            state.syncFirebaseConfig = normalized;
+            await idbSet(SYNC_FIREBASE_DRAFT_KEY, normalized);
+            state.firebaseDraftConfig = normalized;
             return normalized;
           });
         state.firebaseConfigPersistPromise = pending;
         return pending;
-      }
-
-      function invalidateFirebaseSessionForChangedDraft() {
-        const draft = normalizeFirebaseConfig(readFirebaseConfigFromUi());
-        const active = normalizeFirebaseConfig(state.syncFirebaseConfig);
-        const identityChanged = draft.databaseUrl !== active.databaseUrl ||
-          draft.apiKey !== active.apiKey ||
-          draft.email !== active.email;
-        if (!identityChanged || (!state.syncFirebaseRefreshToken && !state.syncFirebaseIdToken)) return;
-        clearFirebaseSessionForConfigChange().catch((error) => {
-          const message = "Firebase-Sitzung konnte nach einer Konfigurationsänderung nicht lokal gelöscht werden.";
-          setSyncStatus(`Datenbank (Firebase): ${message}`);
-          showNotice(`${message} ${error.message}`);
-        });
-        if (state.syncMode === "firebase") {
-          setSyncStatus("Datenbank (Firebase): Konfiguration geändert. Bitte erneut anmelden und verbinden.");
-        }
       }
 
       function scheduleFirebaseConfigDraftPersist() {
@@ -5412,58 +5579,34 @@
       function closeFirebaseDialog() {
         lockFirebaseSensitiveFields();
         el("firebasePassword").value = "";
-        state.firebaseDialogInitialConfig = null;
         el("firebaseDialog").close();
       }
 
       async function connectFirebase() {
-        if (state.firebaseConnectInProgress || state.firebaseConfigImportInProgress) return;
-        const attempt = state.firebaseConnectionAttempt + 1;
-        state.firebaseConnectionAttempt = attempt;
-        state.firebaseConnectionSessionAttempt = 0;
-        state.firebaseConnectionPreserveSessionOnClose = false;
+        if (state.firebaseConnectInProgress || state.firebaseConfigImportInProgress || state.profileSwitching) return;
+        const attempt = ++state.firebaseConnectionAttempt;
         setFirebaseConnectionInProgress(true);
         try {
-          const nextConfig = readFirebaseConfigFromUi();
-          const normalized = normalizeFirebaseConfig(nextConfig);
-          const current = normalizeFirebaseConfig(state.firebaseDialogInitialConfig || state.syncFirebaseConfig);
-          const sameIdentity = normalized.databaseUrl === current.databaseUrl &&
-            normalized.apiKey === current.apiKey &&
-            normalized.email === current.email;
-          if (!normalized.password &&
-            (!sameIdentity || !state.syncFirebaseRefreshToken)) {
-            throw new Error("Bitte Passwort eingeben.");
-          }
-          if (normalized.password) {
-            const session = await signInFirebaseWithPassword(normalized, normalized.password);
-            if (abandonFirebaseConnectionAttempt(attempt)) return;
-            const sessionGeneration = applyFirebaseAuthenticatedSession(session);
-            state.firebaseConnectionSessionAttempt = attempt;
-            await persistFirebaseSession(sessionGeneration);
-          } else {
-            await ensureFirebaseIdToken(normalized, { connectionAttempt: attempt });
-          }
+          const normalized = readFirebaseConfigFromUi();
+          const validationError = validateFirebaseConfig(normalized);
+          if (validationError) throw new Error(validationError);
+          const session = normalized.password ? await signInFirebaseWithPassword(normalized, normalized.password) : null;
           if (abandonFirebaseConnectionAttempt(attempt)) return;
-          const connected = await activateFirebase(nextConfig, {
-            isCurrent: () => isFirebaseConnectionAttemptCurrent(attempt)
+          const connected = await activateFirebase(normalized, {
+            session, isCurrent: () => isFirebaseConnectionAttemptCurrent(attempt)
           });
           if (abandonFirebaseConnectionAttempt(attempt)) return;
           if (connected) {
-            await offerFirebaseConfigExport(state.syncFirebaseConfig);
+            await queueFirebaseConfigPersist(normalized);
+            await offerFirebaseConfigExport(normalized);
             if (abandonFirebaseConnectionAttempt(attempt)) return;
-            state.firebaseConnectionPreserveSessionOnClose = true;
             closeFirebaseDialog();
           }
         } catch (e) {
           if (attempt !== state.firebaseConnectionAttempt) return;
           showNotice(`Firebase-Verbindung fehlgeschlagen: ${e.message}`);
-          setSyncStatus("Datenbank (Firebase): Verbindung fehlgeschlagen.");
         } finally {
-          if (attempt === state.firebaseConnectionAttempt) {
-            setFirebaseConnectionInProgress(false);
-            state.firebaseConnectionSessionAttempt = 0;
-            state.firebaseConnectionPreserveSessionOnClose = false;
-          }
+          if (attempt === state.firebaseConnectionAttempt) setFirebaseConnectionInProgress(false);
         }
       }
 
@@ -5489,76 +5632,18 @@
       }
 
       async function restoreSyncConfig() {
-        setSyncStatus("Datenbank: Nicht verbunden.");
-        applyFirebaseConfigToUi(state.syncFirebaseConfig, { includePassword: false });
-        clearFirebaseSession();
-        try {
-          const mode = await idbGet(SYNC_MODE_KEY);
-          const savedLocalDirectoryHandle = await idbGet(SYNC_LOCAL_DIRECTORY_KEY);
-          const savedLocalFileHandle = await idbGet(SYNC_LOCAL_FILE_KEY);
-          const savedFirebaseConfig = await idbGet(SYNC_FIREBASE_CONFIG_KEY);
-          const savedFirebaseSession = await idbGet(SYNC_FIREBASE_SESSION_KEY);
-          const savedFirebaseConfigExportPrompt = await idbGet(SYNC_FIREBASE_CONFIG_EXPORT_PROMPT_KEY);
-          state.firebaseConfigExportPromptedFingerprint = String(savedFirebaseConfigExportPrompt || "");
-          if (savedFirebaseConfig) {
-            state.syncFirebaseConfig = toPersistedFirebaseConfig(savedFirebaseConfig);
-            applyFirebaseConfigToUi(state.syncFirebaseConfig, { includePassword: false });
-          }
-          if (mode === "firebase" && savedFirebaseSession) {
-            applyFirebaseSession(savedFirebaseSession);
-          }
-
-          if (mode === "local") {
-            if (savedLocalDirectoryHandle && supportsLocalFolderSync()) {
-              state.syncMode = "local";
-              state.syncLocalDirectoryHandle = savedLocalDirectoryHandle;
-              state.syncLocalFileHandle = null;
-              setSyncModeUi("local");
-              setSyncStatus("Datenbank (Lokal): Ordner wiederhergestellt, synchronisiere...");
-              return;
-            }
-            if (savedLocalFileHandle && supportsLocalFileSync()) {
-              state.syncMode = "local";
-              state.syncLocalDirectoryHandle = null;
-              state.syncLocalFileHandle = savedLocalFileHandle;
-              setSyncModeUi("local");
-              setSyncStatus("Datenbank (Lokal): Datei wiederhergestellt, synchronisiere...");
-              return;
-            }
-            if (savedLocalDirectoryHandle || savedLocalFileHandle) {
-              setSyncStatus("Datenbank (Lokal): Gespeichertes Ziel wird von diesem Browser nicht unterstützt.");
-            } else {
-              setSyncStatus("Datenbank (Lokal): Kein gespeichertes Ziel vorhanden.");
-            }
-          } else if (mode === "firebase") {
-            const validationError = validateFirebaseConfig(state.syncFirebaseConfig);
-            if (!validationError) {
-              const normalizedConfig = normalizeFirebaseConfig(state.syncFirebaseConfig);
-              if (normalizedConfig.allowedUid &&
-                state.syncFirebaseUserUid &&
-                state.syncFirebaseUserUid !== normalizedConfig.allowedUid) {
-                await clearFirebaseSessionAndPersist();
-              }
-              state.syncMode = "firebase";
-              setSyncModeUi("firebase");
-              if (!state.syncFirebaseRefreshToken) {
-                setSyncStatus("Datenbank (Firebase): Konfiguration wiederhergestellt. Bitte im Dialog mit Passwort anmelden.");
-              } else {
-                setSyncStatus("Datenbank (Firebase): Sitzung wiederhergestellt, synchronisiere...");
-              }
-              return;
-            }
-            setSyncStatus(`Datenbank (Firebase): ${validationError}`);
-          } else if (mode === "local" && !supportsLocalFolderSync() && !supportsLocalFileSync()) {
-            setSyncStatus("Datenbank (Lokal): In diesem Browser nicht unterstützt.");
-            setSyncModeUi(state.syncMode);
-            return;
-          }
-        } catch (e) {
-          setSyncStatus("Datenbank: Konnte gespeicherte Synchronisierung nicht laden.");
-          throw e;
+        await migrateSyncProfiles();
+        const profile = await idbGet(SYNC_ACTIVE_PROFILE_KEY);
+        state.firebaseDraftConfig = await idbGet(SYNC_FIREBASE_DRAFT_KEY);
+        state.firebaseConfigExportPromptedFingerprint = String(await idbGet(SYNC_FIREBASE_CONFIG_EXPORT_PROMPT_KEY) || "");
+        applyActiveProfile(profile);
+        if (state.syncMode === "firebase") {
+          const validationError = validateFirebaseConfig(state.syncFirebaseConfig);
+          if (validationError) throw new Error(validationError);
         }
+        applyFirebaseConfigToUi(state.firebaseDraftConfig || state.syncFirebaseConfig);
         setSyncModeUi(state.syncMode);
+        setSyncStatus(state.syncMode ? "Datenbank: Profil wiederhergestellt." : "Daten bleiben auf diesem Gerät.");
       }
 
       function getLocalDayStarts(timestamp, count) {
@@ -7112,6 +7197,15 @@
         refreshGlassPointerMotion();
       }
 
+      submitAddCard = trackProfileMutation(submitAddCard);
+      importJSON = trackProfileMutation(importJSON);
+      saveAllCardsDialog = trackProfileMutation(saveAllCardsDialog);
+      saveEditDialog = trackProfileMutation(saveEditDialog);
+      deleteFromEditDialog = trackProfileMutation(deleteFromEditDialog);
+      rate = trackProfileMutation(rate);
+      undoLastRating = trackProfileMutation(undoLastRating);
+      handleDatabaseBackupImportChange = trackProfileMutation(handleDatabaseBackupImportChange);
+
       // Event wiring
       el("tabStudy").addEventListener("click", () => setView("study"));
       el("tabList").addEventListener("click", () => setView("list"));
@@ -7215,18 +7309,12 @@
         }
       });
       el("firebaseDialog").addEventListener("close", () => {
-        // A dialog can also be closed through browser history. In that case a
-        // pending authentication result must no longer be allowed to activate
-        // Firebase after the dialog has gone away.
         if (state.firebaseConnectInProgress) {
-          const discardPendingSession =
-            state.firebaseConnectionSessionAttempt === state.firebaseConnectionAttempt &&
-            !state.firebaseConnectionPreserveSessionOnClose;
           state.firebaseConnectionAttempt += 1;
-          state.firebaseConnectionSessionAttempt = 0;
-          state.firebaseConnectionPreserveSessionOnClose = false;
+          if (state.profileSwitchTransaction) {
+            try { state.profileSwitchTransaction.abort(); } catch (error) {}
+          }
           setFirebaseConnectionInProgress(false);
-          if (discardPendingSession) clearFirebaseSessionAndPersist();
         }
         if (state.firebaseConfigImportInProgress) {
           state.firebaseConfigImportAttempt += 1;
@@ -7234,14 +7322,12 @@
         }
         lockFirebaseSensitiveFields();
         el("firebasePassword").value = "";
-        state.firebaseDialogInitialConfig = null;
       });
       el("firebasePassword").addEventListener("focus", lockFirebasePasswordField);
       el("firebasePassword").addEventListener("input", lockFirebasePasswordField);
       el("firebasePassword").addEventListener("change", lockFirebasePasswordField);
       ["firebaseDatabaseUrl", "firebaseApiKey", "firebaseEmail"].forEach((id) => {
         el(id).addEventListener("input", () => {
-          invalidateFirebaseSessionForChangedDraft();
           scheduleFirebaseConfigDraftPersist();
         });
       });
@@ -7254,6 +7340,7 @@
         autoResizeTextarea(e.target);
       });
 
+      el("btnDeviceProfile").addEventListener("click", activateDeviceProfile);
       el("btnPickSyncFolder").addEventListener("click", chooseSyncFolder);
       el("btnOpenFirebaseDialog").addEventListener("click", openFirebaseDialog);
       el("btnExportFirebaseConfig").addEventListener("click", () => exportFirebaseConfig());
@@ -7420,7 +7507,6 @@
         try {
           await restoreSyncConfig();
           await restoreLocalSnapshot();
-          await restoreSyncOutboxSnapshot();
           await persistLocalSnapshot();
           state.localRestoreComplete = true;
           setLocalDataControlsEnabled(true);
@@ -7435,6 +7521,10 @@
         setView("study");
         updateAppBadge();
         refreshBadgeSchedulers();
+        if (await idbGet(SYNC_PROFILE_MIGRATION_NOTICE_KEY)) {
+          showNotice("Deine bisherigen Karten bleiben unter „Nur auf diesem Gerät“ erhalten. Firebase und lokale Dateien verwenden jetzt getrennte Datenbestände. Über Backup-Export und -Import kannst du Karten gezielt übertragen.");
+          await idbDelete(SYNC_PROFILE_MIGRATION_NOTICE_KEY);
+        }
         await runAutoSync({ silent: true });
       })();
     })();

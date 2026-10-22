@@ -1,0 +1,12 @@
+{
+  "name": "vokabeln",
+  "private": true,
+  "scripts": {
+    "test": "node --test tests/sync-profiles.test.cjs",
+    "test:browser": "node --test tests/sync-profiles.browser.test.cjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "6.2.6",
+    "playwright": "1.61.1"
+  }
+}
