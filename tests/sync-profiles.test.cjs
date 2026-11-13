@@ -46,7 +46,7 @@ function app(indexedDB = new IDBFactory()) {
     fetch: async () => { throw new Error('Unexpected network request'); }
   });
   vm.runInContext(`
-    const STAGES = [0,1,3,7,14,30,60,120,240,365,730];
+    const STAGES = [0,1,3,7,14,30,60,120,240,365,730,1095,1460,1825,2190];
     const CARD_FLAIRS = ['🎓','🇺🇸'];
     const DEFAULT_CARD_FLAIR = CARD_FLAIRS[0];
     const SYNC_DB_NAME = 'vokabeln-sync-db';
