@@ -1814,6 +1814,22 @@
       min-height: 44px;
     }
 
+    .allCardsItem[hidden],
+    .allCardsEmpty[hidden] {
+      display: none;
+    }
+
+    @supports (field-sizing: content) {
+      .allCardsItem {
+        content-visibility: auto;
+        contain-intrinsic-size: auto 62px;
+      }
+
+      .allCardsItem textarea {
+        field-sizing: content;
+      }
+    }
+
     .allCardsItem textarea {
       resize: vertical;
       overflow: hidden;
@@ -6084,6 +6100,7 @@
         draftCard.stage = card.stage;
         draftCard.dueAt = card.dueAt;
         draftCard.updatedAt = card.updatedAt;
+        allCardsSearchTextCache.delete(draftCard);
         return true;
       }
 
@@ -6097,6 +6114,10 @@
       let allCardsDraft = null;
       let allCardsOriginalIds = new Set();
       let allCardsSearchQuery = "";
+      let allCardsRows = [];
+      let allCardsNoMatchNote = null;
+      let allCardsSearchRaf = 0;
+      const allCardsSearchTextCache = new WeakMap();
 
       function buildAllCardsDraft() {
         return state.data.cards.map((card) => ({
@@ -6118,7 +6139,7 @@
           .trim();
       }
 
-      function getAllCardsSearchText(card) {
+      function computeAllCardsSearchText(card) {
         const flair = normalizeCardFlair(card && card.flair, "");
         const flairWords = isUsFlair(flair) ? "us usa flagge englisch" : "standard flair";
         return normalizeAllCardsSearchValue([
@@ -6129,11 +6150,56 @@
         ].join(" "));
       }
 
-      function getAllCardsFilteredDraft(draft) {
+      function getAllCardsSearchText(card) {
+        if (!card || typeof card !== "object") return computeAllCardsSearchText(card);
+        let text = allCardsSearchTextCache.get(card);
+        if (text === undefined) {
+          text = computeAllCardsSearchText(card);
+          allCardsSearchTextCache.set(card, text);
+        }
+        return text;
+      }
+
+      function applyAllCardsSearchFilter() {
+        const draft = Array.isArray(allCardsDraft) ? allCardsDraft : [];
+        if (draft.length === 0) {
+          renderAllCardsSearchStatus(0, 0);
+          return;
+        }
         const query = normalizeAllCardsSearchValue(allCardsSearchQuery);
-        return (Array.isArray(draft) ? draft : [])
-          .map((card, index) => ({ card, index }))
-          .filter((entry) => !query || getAllCardsSearchText(entry.card).includes(query));
+        const dialog = el("allCardsDialog");
+        const canMeasure = !!(dialog && dialog.open) && !supportsFieldSizingContent();
+        const textareasToSize = [];
+        let visibleCount = 0;
+        draft.forEach((card, index) => {
+          const row = allCardsRows[index];
+          if (!row) return;
+          const matches = !query || getAllCardsSearchText(card).includes(query);
+          row.hidden = !matches;
+          if (!matches) return;
+          visibleCount += 1;
+          if (canMeasure && row.dataset.sized !== "1") {
+            row.dataset.sized = "1";
+            row.querySelectorAll("textarea").forEach((textarea) => textareasToSize.push(textarea));
+          }
+        });
+        if (allCardsNoMatchNote) allCardsNoMatchNote.hidden = visibleCount > 0;
+        renderAllCardsSearchStatus(visibleCount, draft.length);
+        autoResizeTextareas(textareasToSize);
+      }
+
+      function scheduleAllCardsSearchFilter() {
+        if (allCardsSearchRaf) return;
+        allCardsSearchRaf = requestAnimationFrame(() => {
+          allCardsSearchRaf = 0;
+          applyAllCardsSearchFilter();
+        });
+      }
+
+      function cancelAllCardsSearchFilter() {
+        if (!allCardsSearchRaf) return;
+        cancelAnimationFrame(allCardsSearchRaf);
+        allCardsSearchRaf = 0;
       }
 
       function renderAllCardsSearchStatus(visibleCount, totalCount) {
@@ -6156,6 +6222,7 @@
         if (searchInput) searchInput.value = "";
         renderAllCardsDialog();
         const opened = showAppDialog(dialog);
+        if (opened) applyAllCardsSearchFilter();
         if (options.focusSearch && searchInput && opened) {
           requestAnimationFrame(() => searchInput.focus({ preventScroll: true }));
         }
@@ -6175,12 +6242,14 @@
         const list = el("allCardsList");
         if (!list) return;
 
+        cancelAllCardsSearchFilter();
         const draft = Array.isArray(allCardsDraft) ? allCardsDraft : [];
-        const visibleDraft = getAllCardsFilteredDraft(draft);
         list.innerHTML = "";
-        renderAllCardsSearchStatus(visibleDraft.length, draft.length);
+        allCardsRows = [];
+        allCardsNoMatchNote = null;
 
         if (draft.length === 0) {
+          renderAllCardsSearchStatus(0, 0);
           const empty = document.createElement("div");
           empty.className = "allCardsEmpty note";
           empty.textContent = "Keine Vokabeln verfügbar.";
@@ -6188,15 +6257,15 @@
           return;
         }
 
-        if (visibleDraft.length === 0) {
-          const empty = document.createElement("div");
-          empty.className = "allCardsEmpty note";
-          empty.textContent = "Keine passenden Vokabeln gefunden.";
-          list.appendChild(empty);
-          return;
-        }
+        const fragment = document.createDocumentFragment();
+        const noMatchNote = document.createElement("div");
+        noMatchNote.className = "allCardsEmpty note";
+        noMatchNote.textContent = "Keine passenden Vokabeln gefunden.";
+        noMatchNote.hidden = true;
+        fragment.appendChild(noMatchNote);
+        allCardsNoMatchNote = noMatchNote;
 
-        visibleDraft.forEach(({ card, index }) => {
+        draft.forEach((card, index) => {
           const row = document.createElement("div");
           row.className = "allCardsItem";
 
@@ -6213,6 +6282,7 @@
           frontInput.addEventListener("input", () => {
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             allCardsDraft[index].front = frontInput.value;
+            allCardsSearchTextCache.delete(allCardsDraft[index]);
             autoResizeTextarea(frontInput);
           });
 
@@ -6224,6 +6294,7 @@
           backInput.addEventListener("input", () => {
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             allCardsDraft[index].back = backInput.value;
+            allCardsSearchTextCache.delete(allCardsDraft[index]);
             autoResizeTextarea(backInput);
           });
 
@@ -6245,6 +6316,7 @@
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             setFlairChoiceValue(flairWrap, flairBtnLeft.dataset.flair);
             allCardsDraft[index].flair = normalizeCardFlair(flairBtnLeft.dataset.flair);
+            allCardsSearchTextCache.delete(allCardsDraft[index]);
             applyRowSpellcheck();
           });
 
@@ -6257,6 +6329,7 @@
             if (!Array.isArray(allCardsDraft) || !allCardsDraft[index]) return;
             setFlairChoiceValue(flairWrap, flairBtnRight.dataset.flair);
             allCardsDraft[index].flair = normalizeCardFlair(flairBtnRight.dataset.flair);
+            allCardsSearchTextCache.delete(allCardsDraft[index]);
             applyRowSpellcheck();
           });
 
@@ -6290,10 +6363,12 @@
 
           actions.append(editBtn, deleteBtn);
           row.append(indexBadge, flairWrap, frontInput, backInput, actions);
-          list.appendChild(row);
-          autoResizeTextarea(frontInput);
-          autoResizeTextarea(backInput);
+          fragment.appendChild(row);
+          allCardsRows.push(row);
         });
+
+        list.appendChild(fragment);
+        applyAllCardsSearchFilter();
       }
 
       async function saveAllCardsDialog() {
@@ -7057,6 +7132,27 @@
         textarea.style.height = `${textarea.scrollHeight}px`;
       }
 
+      let fieldSizingContentSupport = null;
+
+      function supportsFieldSizingContent() {
+        if (fieldSizingContentSupport === null) {
+          try {
+            fieldSizingContentSupport = !!(window.CSS && CSS.supports("field-sizing", "content"));
+          } catch (e) {
+            fieldSizingContentSupport = false;
+          }
+        }
+        return fieldSizingContentSupport;
+      }
+
+      function autoResizeTextareas(textareas) {
+        const items = (Array.isArray(textareas) ? textareas : []).filter(Boolean);
+        if (items.length === 0) return;
+        items.forEach((textarea) => { textarea.style.height = "auto"; });
+        const heights = items.map((textarea) => textarea.scrollHeight);
+        items.forEach((textarea, i) => { textarea.style.height = `${heights[i]}px`; });
+      }
+
       const GLASS_POINTER_SELECTOR = [
         "header",
         ".card",
@@ -7288,7 +7384,7 @@
       el("btnEditLastCompletedCard").addEventListener("click", editLastCompletedCard);
       el("allCardsSearch").addEventListener("input", (event) => {
         allCardsSearchQuery = event.target.value;
-        renderAllCardsDialog();
+        scheduleAllCardsSearchFilter();
       });
       el("btnAllCardsCancel").addEventListener("click", closeAllCardsDialog);
       el("btnAllCardsSave").addEventListener("click", saveAllCardsDialog);
@@ -7300,6 +7396,9 @@
         allCardsDraft = null;
         allCardsOriginalIds = new Set();
         allCardsSearchQuery = "";
+        cancelAllCardsSearchFilter();
+        allCardsRows = [];
+        allCardsNoMatchNote = null;
       });
       el("firebaseDialog").addEventListener("cancel", (event) => {
         // Do not let Escape dismiss the dialog while a sign-in request or a
